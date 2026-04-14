@@ -107,9 +107,11 @@ Dense-path verification is now stable:
 Additional validation coverage now passes in `scripts/validate_fa4_windows_shim.py`:
 
 - local window attention
+- dense `mask_mod`, including fully masked-row stability
 - MQA / GQA style KV head expansion
 - `learnable_sink`
 - varlen output / LSE reconstruction via chunked dense equivalence
+- varlen `score_mod`, including global offset-aware `seqlen_info.offset_k`
 
 Varlen note:
 
@@ -132,7 +134,7 @@ At the moment this repo contains:
 - a verified FA2 Windows path
 - a partially assembled FA4 test env
 - a precise native FA4 import blocker
-- a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`
+- a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, and varlen `score_mod`
 
 It does **not** yet contain a verified native Windows FA4 runtime path.
 
