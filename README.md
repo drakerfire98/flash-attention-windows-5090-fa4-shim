@@ -23,6 +23,8 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/patch_torch_cpp_extension_windows.py`: patches the local torch env to emit a Windows-safe `nvcc` launcher
 - `scripts/patch_flash_attn_setup.py`: patches `setup.py` in the source tree for explicit `BUILD_TARGET` handling
 - `scripts/smoke_test_flash_attn.py`: import and CUDA execution smoke test
+- `scripts/test_fa4_windows_shim.py`: probes the repo-local FA4 import shim and can run a tiny CUDA forward smoke test
+- `shims/`: repo-local compatibility shims used only for FA4 Windows probing
 - `patches/*.patch`: reference diffs for the two required source edits
 
 ## What This Does Not Do
@@ -38,10 +40,12 @@ FlashAttention 4 was tested in a dedicated `.venv_fa4` environment on the same m
 Current status:
 
 - `flash-attn-4` can be installed as an editable package from the local `flash_attn/cute` tree
-- the import path `from flash_attn.cute import flash_attn_func` still fails on Windows here
-- exact failure: `ModuleNotFoundError: No module named 'cutlass'`
+- the native Windows import path still does not work without extra shims
+- a repo-local shim package under `shims/` now shadows `flash_attn.cute` in `.venv_fa4`
+- the shimmed dense `flash_attn_func` forward and backward probes both match torch SDPA exactly in the isolated test
+- the shimmed varlen path was also cross-checked against FA2 behavior for unequal sequence lengths and matched closely
 
-The root cause is that `nvidia-cutlass-dsl==4.4.2` installs only metadata in this environment and still requires `nvidia-cutlass-dsl-libs-base`, which does not currently resolve to a usable Windows package here.
+The root native blocker is still that `nvidia-cutlass-dsl==4.4.2` installs only metadata in this environment and still requires `nvidia-cutlass-dsl-libs-base`, which does not currently resolve to a usable Windows package here. The current stable path is therefore a Windows compatibility shim layered on top of that gap, not a native FA4 kernel path.
 
 See `docs/FA4_WINDOWS_STATUS.md` for the exact attempted install path and blocker.
 
