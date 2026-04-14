@@ -60,6 +60,10 @@ The package metadata also still declares:
 
 That dependency is the unresolved Windows-side blocker in this environment.
 
+## Upstream Support Signal
+
+NVIDIA's current CUTLASS DSL quick-start docs for the latest 4.4 line state that the supported target is Linux. That matches the behavior seen here: the FA4 Python package can be staged, but the actual CuTe DSL runtime layer needed for `cutlass.cute` is not landing as a usable Windows install in this environment.
+
 ## Practical Meaning
 
 At the moment this repo contains:
