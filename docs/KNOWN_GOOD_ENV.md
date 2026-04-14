@@ -8,13 +8,16 @@ Verified on `2026-04-14`.
 
 ## OS And Toolchain
 
-- OS: Windows 11 x64
+- OS: `Windows 10 Pro` / display version `25H2` / build `26200.8037`
 - Python: `3.13.9`
 - Visual Studio: 2022 Community
+- MSVC toolset dir: `14.44.35207`
+- `cl.exe` version: `19.44.35219.0`
 - VC bootstrap: `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat`
 - CUDA toolkit: `13.0`
+- `nvcc` version: `V13.0.88`
 - NVCC path: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin\nvcc.exe`
-- Ninja: installed from the Python `ninja` package
+- `ninja` version: `1.13.0.git.kitware.jobserver-pipe-1`
 
 ## Python Stack
 
@@ -29,6 +32,7 @@ Verified on `2026-04-14`.
 ## Source Tree
 
 - Upstream source repo: `https://github.com/sdbds/flash-attention-for-windows`
+- Upstream source commit: `5ef792cb0fcccb37c5ee748b312d17ef969718f5`
 - Required source patch 1: `setup.py` explicit `BUILD_TARGET` and `IS_ROCM` initialization
 - Required source patch 2: local torch `cpp_extension.py` Windows `nvcc` quoting fix
 
