@@ -24,7 +24,16 @@ Do not use `torch 2.6.0+cu124` on this machine. That path failed on the 5090 wit
 git clone https://github.com/sdbds/flash-attention-for-windows third_party/flash-attention-for-windows
 ```
 
-## 4. Build From Source
+## 4. Capture Your Local Environment
+
+```powershell
+.\.venv\Scripts\python.exe scripts\collect_env.py --json-out local_env.json
+```
+
+This does not make the compile kernel faster, but it does make rebuild and debugging cycles faster because it captures the exact machine, torch, CUDA, ninja, nvcc, and source-tree fingerprint in one file.
+It reports the current environment as-is, so if your shell still points at a different `CUDA_HOME` than the build wrapper, the JSON will show that mismatch directly.
+
+## 5. Build From Source
 
 ```powershell
 cmd /c scripts\build_flashattn_windows.cmd
@@ -38,7 +47,7 @@ This wrapper:
 - patches upstream `setup.py`
 - runs `pip install --no-build-isolation .` inside the source tree
 
-## 5. Verify Runtime
+## 6. Verify Runtime
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\smoke_test_flash_attn.py

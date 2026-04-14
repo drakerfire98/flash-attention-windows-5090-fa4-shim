@@ -19,6 +19,7 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `docs/KNOWN_GOOD_ENV.md`: exact versions that worked
 - `docs/REBUILD_STEPS.md`: repeatable rebuild instructions
 - `scripts/build_flashattn_windows.cmd`: wrapper to compile from source
+- `scripts/collect_env.py`: emits a JSON fingerprint of the local machine, Python env, and toolchain
 - `scripts/patch_torch_cpp_extension_windows.py`: patches the local torch env to emit a Windows-safe `nvcc` launcher
 - `scripts/patch_flash_attn_setup.py`: patches `setup.py` in the source tree for explicit `BUILD_TARGET` handling
 - `scripts/smoke_test_flash_attn.py`: import and CUDA execution smoke test
@@ -34,8 +35,9 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 
 1. Clone this repo.
 2. Clone `https://github.com/sdbds/flash-attention-for-windows` into `third_party/flash-attention-for-windows`.
-3. Follow `docs/REBUILD_STEPS.md`.
-4. Compare your local machine against `docs/KNOWN_GOOD_ENV.md` before debugging build failures.
+3. Run `python scripts/collect_env.py --json-out local_env.json` if you want a one-shot machine fingerprint before touching the build.
+4. Follow `docs/REBUILD_STEPS.md`.
+5. Compare your local machine against `docs/KNOWN_GOOD_ENV.md` before debugging build failures.
 
 ## License
 
