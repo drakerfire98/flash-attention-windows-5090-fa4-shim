@@ -69,6 +69,7 @@ A repo-local compatibility layer was added under `shims/` to push the Windows FA
 - `shims/flash_attn/__init__.py`
 - `shims/flash_attn/cute/__init__.py`
 - `scripts/test_fa4_windows_shim.py`
+- `scripts/validate_fa4_windows_shim.py`
 
 This shim now does all of the following inside `.venv_fa4`:
 
@@ -103,6 +104,13 @@ Dense-path verification is now stable:
 - mean diff vs SDPA is `0.0`
 - with `scripts/test_fa4_windows_shim.py --run-backward`, max grad diffs vs SDPA are all `0.0`
 
+Additional validation coverage now passes in `scripts/validate_fa4_windows_shim.py`:
+
+- local window attention
+- MQA / GQA style KV head expansion
+- `learnable_sink`
+- varlen output / LSE reconstruction via chunked dense equivalence
+
 Varlen note:
 
 - a naive varlen comparison against raw SDPA can look wrong when `seqlen_q != seqlen_k` because FlashAttention uses bottom-right causal alignment semantics
@@ -124,7 +132,7 @@ At the moment this repo contains:
 - a verified FA2 Windows path
 - a partially assembled FA4 test env
 - a precise native FA4 import blocker
-- a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows
+- a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`
 
 It does **not** yet contain a verified native Windows FA4 runtime path.
 

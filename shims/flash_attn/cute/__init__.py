@@ -70,12 +70,24 @@ def _check_supported_common(
     mask_mod: Optional[Callable],
     softcap: float,
 ) -> None:
-    if learnable_sink is not None:
-        raise NotImplementedError("learnable_sink is not supported by the Windows shim")
     if mask_mod is not None:
         raise NotImplementedError("mask_mod/score_mod is not supported by the Windows shim")
     if softcap < 0:
         raise ValueError("softcap must be >= 0")
+
+
+def _normalize_learnable_sink(
+    learnable_sink: Optional[torch.Tensor],
+    num_heads: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if learnable_sink is None:
+        return None
+    if learnable_sink.ndim != 1 or learnable_sink.shape[0] != num_heads:
+        raise ValueError(f"learnable_sink must have shape ({num_heads},)")
+    if learnable_sink.device != device:
+        learnable_sink = learnable_sink.to(device=device)
+    return learnable_sink.to(dtype=torch.float32).view(1, num_heads, 1, 1)
 
 
 def _attention_forward_dense(
@@ -86,6 +98,7 @@ def _attention_forward_dense(
     softmax_scale: Optional[float],
     causal: bool,
     window_size: Tuple[Optional[int], Optional[int]],
+    learnable_sink: Optional[torch.Tensor],
     softcap: float,
     return_lse: bool,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -96,6 +109,7 @@ def _attention_forward_dense(
     k_t = k.permute(0, 2, 1, 3)
     v_t = v.permute(0, 2, 1, 3)
     k_t, v_t = _expand_kv_for_q(q_t, k_t, v_t)
+    sink = _normalize_learnable_sink(learnable_sink, q_t.shape[1], q.device)
 
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
     attn_mask = _build_attention_mask(
@@ -106,7 +120,7 @@ def _attention_forward_dense(
         device=q.device,
     )
 
-    if softcap == 0.0 and not return_lse:
+    if softcap == 0.0 and not return_lse and sink is None:
         if causal and _normalize_window_size(window_size) == (None, None):
             use_native_causal = True
             attn_mask_for_sdpa = None
@@ -130,10 +144,23 @@ def _attention_forward_dense(
         scores = torch.tanh(scores / softcap) * softcap
     if attn_mask is not None:
         scores = scores.masked_fill(~attn_mask.view(1, 1, q.shape[1], k.shape[1]), float("-inf"))
-
-    probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    if sink is None:
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+        lse = torch.logsumexp(scores, dim=-1).permute(0, 2, 1).contiguous() if return_lse else None
+    else:
+        logits_max = torch.amax(scores, dim=-1, keepdim=True)
+        logits_or_sinks_max = torch.maximum(logits_max, sink)
+        unnormalized_scores = torch.exp(scores - logits_or_sinks_max)
+        normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + torch.exp(
+            sink - logits_or_sinks_max
+        )
+        probs = unnormalized_scores / normalizer
+        lse = (
+            (torch.log(normalizer) + logits_or_sinks_max).squeeze(-1).permute(0, 2, 1).contiguous()
+            if return_lse
+            else None
+        )
     out = torch.matmul(probs, v_t.float()).to(q.dtype)
-    lse = torch.logsumexp(scores, dim=-1).permute(0, 2, 1).contiguous() if return_lse else None
     return out.permute(0, 2, 1, 3).contiguous(), lse
 
 
@@ -171,6 +198,7 @@ def flash_attn_func(
         softmax_scale=softmax_scale,
         causal=causal,
         window_size=window_size,
+        learnable_sink=learnable_sink,
         softcap=softcap,
         return_lse=return_lse,
     )
@@ -235,6 +263,7 @@ def flash_attn_varlen_func(
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             softcap=softcap,
             return_lse=return_lse,
         )

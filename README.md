@@ -24,6 +24,7 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/patch_flash_attn_setup.py`: patches `setup.py` in the source tree for explicit `BUILD_TARGET` handling
 - `scripts/smoke_test_flash_attn.py`: import and CUDA execution smoke test
 - `scripts/test_fa4_windows_shim.py`: probes the repo-local FA4 import shim and can run a tiny CUDA forward smoke test
+- `scripts/validate_fa4_windows_shim.py`: broader validation matrix for the Windows FA4 shim
 - `shims/`: repo-local compatibility shims used only for FA4 Windows probing
 - `patches/*.patch`: reference diffs for the two required source edits
 
@@ -44,6 +45,7 @@ Current status:
 - a repo-local shim package under `shims/` now shadows `flash_attn.cute` in `.venv_fa4`
 - the shimmed dense `flash_attn_func` forward and backward probes both match torch SDPA exactly in the isolated test
 - the shimmed varlen path was also cross-checked against FA2 behavior for unequal sequence lengths and matched closely
+- the shim now also supports `learnable_sink` and passes the broader validation matrix in `scripts/validate_fa4_windows_shim.py`
 
 The root native blocker is still that `nvidia-cutlass-dsl==4.4.2` installs only metadata in this environment and still requires `nvidia-cutlass-dsl-libs-base`, which does not currently resolve to a usable Windows package here. The current stable path is therefore a Windows compatibility shim layered on top of that gap, not a native FA4 kernel path.
 
