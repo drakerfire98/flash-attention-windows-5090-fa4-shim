@@ -760,6 +760,7 @@ def main() -> int:
     import flash_attn.cute.interface as iface
     from cutlass.cute._compile_bridge import compat_replay_varlen_backward
     from cutlass.cute._native_bwd_helpers_backend import native_bwd_helpers_backend_status
+    from cutlass.cute._native_dense_bwd_backend import native_dense_bwd_backend_status
     from cutlass.cute._native_dense_backend import native_dense_backend_status
     from cutlass.cute._native_varlen_backend import native_varlen_backend_status
 
@@ -770,6 +771,7 @@ def main() -> int:
     print(f"native_interface={interface_target}")
     print(f"loaded_interface={getattr(iface, '__file__', '<unknown>')}")
     print(f"native_dense_backend_pre={native_dense_backend_status()}")
+    print(f"native_dense_bwd_backend_pre={native_dense_bwd_backend_status()}")
     print(f"native_varlen_backend_pre={native_varlen_backend_status()}")
     print(f"native_bwd_helpers_backend_pre={native_bwd_helpers_backend_status()}")
     for runner in (
@@ -791,6 +793,7 @@ def main() -> int:
         _clear_compile_caches(iface)
         runner()
     print(f"native_dense_backend_post={native_dense_backend_status()}")
+    print(f"native_dense_bwd_backend_post={native_dense_bwd_backend_status()}")
     print(f"native_varlen_backend_post={native_varlen_backend_status()}")
     print(f"native_bwd_helpers_backend_post={native_bwd_helpers_backend_status()}")
     return 0

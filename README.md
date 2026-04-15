@@ -22,7 +22,7 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/collect_env.py`: emits a JSON fingerprint of the local machine, Python env, and toolchain
 - `scripts/patch_torch_cpp_extension_windows.py`: patches the local torch env to emit a Windows-safe `nvcc` launcher
 - `scripts/patch_flash_attn_setup.py`: patches `setup.py` in the source tree for explicit `BUILD_TARGET` handling
-- `scripts/patch_flash_attn_sm120_backward.py`: patches the local upstream FA4 source tree so the SM120 backward path does not reference `dQ_single_wg` before assignment
+- `scripts/patch_flash_attn_sm120_backward.py`: patches the repo-local FA4 runtime overlay by default so the active SM120 path stays compatible; you can still pass an explicit upstream target during overlay refreshes
 - `scripts/smoke_test_flash_attn.py`: import and CUDA execution smoke test
 - `scripts/test_fa4_windows_shim.py`: probes the repo-local FA4 import shim and can run a tiny CUDA forward smoke test
 - `scripts/validate_fa4_windows_shim.py`: broader validation matrix for the Windows FA4 shim
@@ -34,6 +34,7 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/probe_native_fa4_forward.py`: native-path forward probe covering base dense attention, dense `softcap`, dense `mask_mod`, and varlen `softcap`
 - `scripts/probe_native_fa4_backward.py`: dense + varlen native-path backward parity probe against the stable Windows shim
 - `scripts/build_native_dense_backend.py`: rebuilds the compiled dense forward backend slice for the native FA4 bridge
+- `scripts/build_native_dense_bwd_backend.py`: rebuilds the compiled dense backward backend slice for the native FA4 bridge
 - `scripts/build_native_varlen_backend.py`: rebuilds the compiled varlen forward backend slice for the native FA4 bridge
 - `scripts/build_native_bwd_helpers_backend.py`: rebuilds the compiled backward preprocess/postprocess helper backend slice for the native FA4 bridge
 - `runtime_compat/`: installable Windows import-compat package that restores the old top-level `cuda` API shape and provides a discoverable `nvidia_cutlass_dsl` module name
@@ -81,10 +82,11 @@ Current status:
 - the forward-combine bridge is now backed by a repo-built Windows extension module (`fa4_windows_native_combine_ext.cp313-win_amd64.pyd`) instead of the pure Python shim core
 - the forward-combine runtime path no longer has to escape back into `shims/flash_attn/cute` when that compiled slice is unavailable; it now falls back to a repo-owned local combine implementation inside `cutlass_runtime/src/cutlass/cute/_native_backend.py`
 - the plain batched dense forward family now also has a repo-built Windows extension module (`fa4_windows_native_dense_ext.cp313-win_amd64.pyd`), and the native forward probe now reports `dense_backend=compiled`
-- the same dense compiled backend now also covers the tested local-window and `learnable_sink` dense cases exactly, and covers dense `softcap` with near-exact parity versus the stable Windows shim
+- the same dense compiled backend now also covers the tested local-window and `learnable_sink` dense cases exactly, while dense `softcap` now routes through the exact repo-local runtime path instead of the compiled slice
 - the plain varlen forward family now also has a repo-built Windows extension module (`fa4_win_varlen_ext.cp313-win_amd64.pyd`), and the native probes now report `varlen_backend=compiled`
 - that compiled varlen backend now covers the tested mixed padded/packed layouts, `seqused_q` / `seqused_k`, and paged-KV no-modifier cases exactly against the stable Windows shim, while plain varlen `softcap` is currently near-exact
 - the dense backward replay path now also reuses that compiled dense backend for the same plain family before falling back to the validated shim path
+- the broader dense backward family now also has a repo-built Windows extension module (`fa4_win_dbwd_ext.cp313-win_amd64.pyd`), covering the tested dense plain, local-window, `learnable_sink`, and keep-mask-based backward cases through a compiled slice
 - the varlen backward replay path now also reuses that compiled varlen backend for the same no-modifier family before falling back to the validated shim path
 - the backward preprocess/postprocess helper family now also has a repo-built Windows extension module (`fa4_win_bwdh_ext.cp313-win_amd64.pyd`), and the native backward probe reports `last_op=postprocess_copy`
 - the upstream `compute_block_sparsity(...)` compile family now also resolves through a real `NativeProbeBlockSparsityBridge`, with exact parity versus the stable Windows shim for both exact and fast-sampling test cases
@@ -94,7 +96,7 @@ Current status:
 - the backward bridge now also preserves forward-only feature metadata so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim without changing the user-facing API call shape
 - widened native-path modifier routing now stays inside repo-owned runtime code: dense `mask_mod`, dense block sparsity, dense `score_mod`, varlen `score_mod`, varlen `seqused + score_mod`, paged-KV, and internal varlen block-sparse replay now route through `cutlass_runtime/src/cutlass/cute/_runtime_local_core.py` plus compiled keep-mask slices instead of direct runtime calls back into the stable shim
 - widened native-path modifier probes now show:
-  - dense `softcap` forward and backward parity are near-exact against the stable Windows shim
+  - dense `softcap` forward and backward parity are exact against the stable Windows shim
   - dense `learnable_sink` forward and backward parity are exact against the stable Windows shim
   - dense `mask_mod` forward and backward parity are exact against the stable Windows shim
   - dense `score_mod` forward parity is exact against the stable Windows shim
@@ -127,15 +129,16 @@ The root native blocker is now pinned down more precisely than just "missing whe
 Current checkpoint caveat:
 
 - the repo-owned overlay at `flash_attn_runtime/src/flash_attn/cute/interface.py` now carries the active runtime interface path
-- the sync helper at `scripts/sync_flash_attn_runtime_overlay.py` refreshes that overlay from the upstream clone and reapplies the SM120 compatibility patch when needed
+- `scripts/patch_flash_attn_sm120_backward.py` now targets that overlay path by default, and the sync helper at `scripts/sync_flash_attn_runtime_overlay.py` refreshes it from the upstream clone when needed
 - the public backward path now cleanly accepts dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod`, all of which probe exact against the stable Windows shim
 - the runtime compile bridge no longer directly loads `shims/flash_attn/cute` for forward-combine fallback; combine fallback is now handled inside the repo-owned runtime layer
 - the compiled backend slices now live in:
   - `cutlass_runtime/src/cutlass/cute/_native_backend.py` and `_native_combine_backend.cpp`
   - `cutlass_runtime/src/cutlass/cute/_native_dense_backend.py` and `_native_dense_backend.cpp`
+  - `cutlass_runtime/src/cutlass/cute/_native_dense_bwd_backend.py` and `_native_dense_bwd_backend.cpp`
   - `cutlass_runtime/src/cutlass/cute/_native_varlen_backend.py` and `_native_varlen_backend.cpp`
   - `cutlass_runtime/src/cutlass/cute/_native_bwd_helpers_backend.py` and `_native_bwd_helpers_backend.cpp`
-  - with `scripts/build_native_combine_backend.py`, `scripts/build_native_dense_backend.py`, `scripts/build_native_varlen_backend.py`, and `scripts/build_native_bwd_helpers_backend.py` available to rebuild the `.pyd` files
+  - with `scripts/build_native_combine_backend.py`, `scripts/build_native_dense_backend.py`, `scripts/build_native_dense_bwd_backend.py`, `scripts/build_native_varlen_backend.py`, and `scripts/build_native_bwd_helpers_backend.py` available to rebuild the `.pyd` files
 
 See `docs/FA4_WINDOWS_STATUS.md` for the exact attempted install path and blocker.
 

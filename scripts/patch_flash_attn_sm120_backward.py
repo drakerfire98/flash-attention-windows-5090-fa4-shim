@@ -4,15 +4,12 @@ import sys
 from pathlib import Path
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
 def _default_target() -> Path:
-    return (
-        Path(__file__).resolve().parents[2]
-        / "third_party"
-        / "flash-attention-for-windows"
-        / "flash_attn"
-        / "cute"
-        / "interface.py"
-    )
+    return _repo_root() / "flash_attn_runtime" / "src" / "flash_attn" / "cute" / "interface.py"
 
 
 def _apply_patch(text: str, old: str, new: str) -> tuple[str, bool]:

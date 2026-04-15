@@ -381,6 +381,7 @@ So the modifier surface is now much cleaner:
 - the broader plain dense forward path now reaches a compiled Windows backend slice for the tested dense no-modifier cases, including local-window and `learnable_sink`
 - the broader plain varlen forward path now also reaches a compiled Windows backend slice for the tested mixed padded/packed no-modifier cases, including paged-KV after local materialization
 - dense `softcap`, `learnable_sink`, and `mask_mod` are stable on the native probe bridge path in both forward and backward parity probes
+- dense `softcap` now routes through the exact repo-local runtime path instead of the compiled dense slice, so the seeded forward and backward probes are exact again against the stable Windows shim
 - varlen `softcap` is stable on the native probe bridge path with near-exact forward parity
 - varlen `seqused_q` / `seqused_k` and the mixed `seqused + score_mod` backward path are now also stable on the native probe bridge path
 - varlen paged-KV is now stable on the native probe bridge path in both forward and backward parity probes
@@ -404,9 +405,9 @@ native FA4 kernel implementation.
 
 Checkpoint note:
 
-- the current backward checkpoint also relies on one local upstream source fix in `third_party/flash-attention-for-windows/flash_attn/cute/interface.py`
+- the current backward checkpoint still relies on the repo-local overlay fix in `flash_attn_runtime/src/flash_attn/cute/interface.py`
 - that fix initializes `dQ_single_wg = False` before the architecture branch so the SM120 backward path does not raise `UnboundLocalError`
-- the latest checkpoint also relies on local upstream compat patches in that same file so varlen paged-KV backward can replay through the repo-local shim helper instead of tripping `_flash_attn_bwd`'s dense shape assumptions
+- the latest checkpoint also relies on compat patches in that same overlay file so varlen paged-KV backward can replay through the repo-local shim helper instead of tripping `_flash_attn_bwd`'s dense shape assumptions
 
 ## Practical Meaning
 
@@ -433,6 +434,7 @@ At the moment this repo contains:
 - repo-built compiled Windows backend slices for:
   - the forward-combine family under `cutlass_runtime/src/cutlass/cute/_native_backend.py` and `_native_combine_backend.cpp`
   - the plain dense forward family under `cutlass_runtime/src/cutlass/cute/_native_dense_backend.py` and `_native_dense_backend.cpp`
+  - the broader dense backward family under `cutlass_runtime/src/cutlass/cute/_native_dense_bwd_backend.py` and `_native_dense_bwd_backend.cpp`
   - the plain varlen forward family under `cutlass_runtime/src/cutlass/cute/_native_varlen_backend.py` and `_native_varlen_backend.cpp`
   - the backward preprocess/postprocess helper family under `cutlass_runtime/src/cutlass/cute/_native_bwd_helpers_backend.py` and `_native_bwd_helpers_backend.cpp`
 - a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, the mixed packed/padded varlen layouts, and the public backward replay for dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod`

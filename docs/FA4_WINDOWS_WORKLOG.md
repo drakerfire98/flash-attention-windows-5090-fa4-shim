@@ -115,7 +115,7 @@
   - `cutlass_cute_file` resolves to `cutlass_runtime/src/cutlass/cute/__init__.py`
   - `pycute_loaded=False`
   - `cutlass_shim_module_count=0`
-- `.\.venv_fa4\Scripts\python.exe scripts\patch_flash_attn_sm120_backward.py ..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
+- `.\.venv_fa4\Scripts\python.exe scripts\patch_flash_attn_sm120_backward.py`
   - `already patched`
   - `verification=ok`
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_forward.py`
@@ -152,11 +152,14 @@
 - `.\.venv_fa4\Scripts\python.exe scripts\build_native_varlen_backend.py`
   - `native_varlen_loaded=True`
   - `native_varlen_error=None`
+- `.\.venv_fa4\Scripts\python.exe scripts\build_native_dense_bwd_backend.py`
+  - `native_dense_bwd_loaded=True`
+  - `native_dense_bwd_error=None`
 - inline SplitKV block-sparsity smoke check via `.venv_fa4`
   - `splitkv_block_sparse_out_finite=True`
   - `splitkv_block_sparse_lse_finite=True`
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_combine.py`
-  - `patched_interface=..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
+  - `patched_interface=flash_attn_runtime/src/flash_attn/cute/interface.py`
   - all tested combine parity cases remain exact
 - `FA4_WINDOWS_NATIVE_COMBINE_DISABLE=1 .\.venv_fa4\Scripts\python.exe ...`
   - `combine_fallback_out_finite=True`
@@ -175,7 +178,10 @@
 - The remaining blocker is no longer active `cutlass.*` leakage from `native_probe_shims` or a direct runtime dependency on `shims/flash_attn/cute`; the forward-combine family, the broader plain dense forward family, the broader plain varlen forward family, and the backward helper family now build through real compiled Windows extensions, and the modifier families now route through repo-owned local runtime code, but the rest of `cutlass.cute.compile` still resolves recognized kernels to repo-local bridge objects instead of a true compiled Windows CuTe/CUTLASS DSL backend.
 - The current probe mode is now `runtime-local-core`, which is better than `runtime-wrapper+legacy-core` but still not a true native compiler/runtime.
 - The active `flash_attn.cute.interface` surface is now repo-local under `flash_attn_runtime/src/flash_attn/cute/interface.py`; the upstream clone is now a refresh source, not a live runtime dependency.
+- `scripts/patch_flash_attn_sm120_backward.py` now defaults to that repo-local overlay target instead of the upstream clone path.
 - The public backward path now accepts dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod` through the replay bridge, and the native backward probe reports exact parity for those cases.
+- The dense backward bridge now also has a compiled Windows slice for the tested dense plain, local-window, `learnable_sink`, and keep-mask cases.
+- Dense `softcap` now routes through the exact repo-local runtime path, so the seeded forward and backward probes are exact again against the stable Windows shim.
 - The forward-combine probe now reports `NativeCompiledForwardCombineBridge` with `backend=compiled`, backed by `fa4_windows_native_combine_ext.cp313-win_amd64.pyd`, and all tested batched/varlen/dynamic combine cases remain exact.
 - The forward probe now reports `NativeProbeForwardBridge ... dense_backend=compiled varlen_backend=compiled`, backed by `fa4_windows_native_dense_ext.cp313-win_amd64.pyd` and `fa4_win_varlen_ext.cp313-win_amd64.pyd`, and the backward replay probe reuses those same compiled slices without regressing the seeded parity checks.
 
