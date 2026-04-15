@@ -192,6 +192,30 @@ def _run_dense_learnable_sink(native_flash_attn_func, shim_mod):
     _print_case_metrics("dense_learnable_sink", native_out, ref_out, native_lse, ref_lse)
 
 
+def _run_dense_window(native_flash_attn_func, shim_mod):
+    torch.manual_seed(17)
+    q = torch.randn(1, 22, 2, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 22, 2, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 22, 2, 64, device="cuda", dtype=torch.bfloat16)
+    native_out, native_lse = native_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        window_size=(3, 2),
+        return_lse=True,
+    )
+    ref_out, ref_lse = shim_mod.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        window_size=(3, 2),
+        return_lse=True,
+    )
+    _print_case_metrics("dense_window", native_out, ref_out, native_lse, ref_lse)
+
+
 def _run_dense_mask_mod(native_flash_attn_func, shim_mod):
     torch.manual_seed(11)
     q = torch.randn(1, 20, 2, 64, device="cuda", dtype=torch.bfloat16)
@@ -517,6 +541,7 @@ def main() -> int:
     import flash_attn.cute.interface as iface
     import cutlass
     from cutlass.cute._native_dense_backend import native_dense_backend_status
+    from cutlass.cute._native_varlen_backend import native_varlen_backend_status
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the native forward probe")
@@ -527,11 +552,13 @@ def main() -> int:
     print(f"cutlass_probe_mode={getattr(cutlass, 'NATIVE_PROBE_MODE', '<unknown>')}")
     print(f"cutlass_probe_reason={getattr(cutlass, 'NATIVE_PROBE_REASON', '<unknown>')}")
     print(f"native_dense_backend_pre={native_dense_backend_status()}")
+    print(f"native_varlen_backend_pre={native_varlen_backend_status()}")
 
     for runner in (
         lambda: _run_dense_base(flash_attn_func),
         lambda: _run_dense_softcap(flash_attn_func, shim_mod),
         lambda: _run_dense_learnable_sink(flash_attn_func, shim_mod),
+        lambda: _run_dense_window(flash_attn_func, shim_mod),
         lambda: _run_dense_mask_mod(flash_attn_func, shim_mod),
         lambda: _run_dense_block_sparse(flash_attn_func, shim_mod),
         lambda: _run_varlen_softcap(flash_attn_varlen_func, shim_mod),
@@ -551,6 +578,7 @@ def main() -> int:
     if compiled_values:
         print(f"compiled_repr_sample={repr(compiled_values[0])}")
     print(f"native_dense_backend_post={native_dense_backend_status()}")
+    print(f"native_varlen_backend_post={native_varlen_backend_status()}")
     return 0
 
 

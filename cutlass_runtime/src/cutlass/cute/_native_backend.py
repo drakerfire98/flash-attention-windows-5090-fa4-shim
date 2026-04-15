@@ -137,7 +137,13 @@ def load_native_combine_backend(*, verbose: bool = False, force_rebuild: bool = 
                 for candidate in module_candidates:
                     candidate.unlink(missing_ok=True)
                 module_candidates = []
-            if not module_candidates:
+            newest_module = max(module_candidates, key=lambda path: path.stat().st_mtime) if module_candidates else None
+            source_mtime = max(
+                native_combine_source_path().stat().st_mtime,
+                native_combine_setup_path().stat().st_mtime,
+            )
+            needs_rebuild = newest_module is None or newest_module.stat().st_mtime < source_mtime
+            if needs_rebuild:
                 build_temp_dir = build_dir / "temp"
                 build_temp_dir.mkdir(parents=True, exist_ok=True)
                 cmd = [

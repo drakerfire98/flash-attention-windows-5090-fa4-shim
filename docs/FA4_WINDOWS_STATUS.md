@@ -259,7 +259,8 @@ Current probe result:
 - `scripts/probe_native_fa4_forward.py` now reaches a tiny CUDA forward call through that native path
 - recognized FA4 forward-kernel `cute.compile(...)` calls now return a real `NativeProbeForwardBridge` object instead of a dead placeholder
 - that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
-- the plain batched dense forward family now also routes through a repo-built Windows extension module (`fa4_windows_native_dense_ext*.pyd`) for the no-window, no-modifier path
+- the broader plain dense forward family now also routes through a repo-built Windows extension module (`fa4_windows_native_dense_ext*.pyd`)
+- the broader plain varlen forward family now also routes through a repo-built Windows extension module (`fa4_win_varlen_ext*.pyd`)
 - recognized FA4 forward-combine `cute.compile(...)` calls now also return a real `NativeProbeForwardCombineBridge`
 - that forward-combine bridge now also handles `num_splits_dynamic_ptr`, with exact parity in both the batched and varlen dynamic-split probe cases
 - the forward-combine bridge now builds and loads a real Windows extension module (`fa4_windows_native_combine_ext*.pyd`) through `cutlass_runtime/src/cutlass/cute/_native_backend.py`
@@ -285,7 +286,7 @@ Observed probe output with `return_lse=True`:
 - SDPA reference sum: about `134.21`
 - LSE type: `Tensor`
 - compiled kernel cache entry type: `NativeProbeForwardBridge`
-- compiled kernel cache entry repr: `<NativeProbeForwardBridge FlashAttentionForwardSm120>`
+- compiled kernel cache entry repr: `<NativeProbeForwardBridge FlashAttentionForwardSm120 dense_backend=compiled varlen_backend=compiled>`
 - CUTLASS probe mode: `runtime-local-core`
 - CUTLASS probe reason: the repo-local `cutlass_runtime/` package now owns the top-level `cutlass` root and the currently imported CUTLASS compatibility subpackages directly; the remaining blocker is still the lack of a standalone compiled CUTLASS DSL runtime
 
@@ -299,11 +300,11 @@ Observed backward probe output:
 Observed widened modifier probe output:
 
 - dense `softcap` forward:
-  - output max diff vs stable shim: `0.0`
-  - LSE max diff vs stable shim: `0.0`
+  - output max diff vs stable shim: `0.0078125`
+  - LSE max diff vs stable shim: `0.0013653337955474854`
 - dense `softcap` backward:
-  - output max diff vs stable shim: `0.0`
-  - grad max diff vs stable shim: `0.0`
+  - output max diff vs stable shim: `0.0078125`
+  - grad max diff vs stable shim: `0.00390625`
 - dense `learnable_sink` backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
@@ -317,8 +318,8 @@ Observed widened modifier probe output:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
 - varlen `softcap` forward:
-  - output max diff vs stable shim: `0.0`
-  - LSE max diff vs stable shim: `0.0`
+  - output max diff vs stable shim: `3.814697265625e-06`
+  - LSE max diff vs stable shim: `1.8894672393798828e-05`
 - varlen `seqused_q` / `seqused_k` backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
@@ -365,9 +366,10 @@ Observed cubin loader probe output:
 
 So the modifier surface is now much cleaner:
 
-- the plain batched dense forward path now reaches a compiled Windows backend slice for the tested no-window, no-modifier case
+- the broader plain dense forward path now reaches a compiled Windows backend slice for the tested dense no-modifier cases, including local-window and `learnable_sink`
+- the broader plain varlen forward path now also reaches a compiled Windows backend slice for the tested mixed padded/packed no-modifier cases, including paged-KV after local materialization
 - dense `softcap`, `learnable_sink`, and `mask_mod` are stable on the native probe bridge path in both forward and backward parity probes
-- varlen `softcap` is stable on the native probe bridge path
+- varlen `softcap` is stable on the native probe bridge path with near-exact forward parity
 - varlen `seqused_q` / `seqused_k` and the mixed `seqused + score_mod` backward path are now also stable on the native probe bridge path
 - varlen paged-KV is now stable on the native probe bridge path in both forward and backward parity probes
 - varlen `softcap + score_mod` is now stable on the native probe bridge path in both forward and backward parity probes
@@ -406,6 +408,7 @@ At the moment this repo contains:
   - direct cubin loading, now fixed by the runtime-library shim path
 - upstream forward-combine and block-sparsity compile families, now covered by probe bridges
 - upstream plain dense forward, now covered by a second compiled Windows backend slice
+- upstream plain varlen forward, now covered by a third compiled Windows backend slice
 - direct bridge validation now also covers block-sparse forward execution and dynamic split-aware combine execution
 - shim validator coverage now also includes varlen paged-KV and combined varlen `softcap + score_mod`
 - the remaining honest blocker: no true end-to-end Windows CuTe DSL compiler/runtime behind the rest of that import surface
@@ -418,6 +421,8 @@ At the moment this repo contains:
 - repo-built compiled Windows backend slices for:
   - the forward-combine family under `cutlass_runtime/src/cutlass/cute/_native_backend.py` and `_native_combine_backend.cpp`
   - the plain dense forward family under `cutlass_runtime/src/cutlass/cute/_native_dense_backend.py` and `_native_dense_backend.cpp`
+  - the plain varlen forward family under `cutlass_runtime/src/cutlass/cute/_native_varlen_backend.py` and `_native_varlen_backend.cpp`
+  - the backward preprocess/postprocess helper family under `cutlass_runtime/src/cutlass/cute/_native_bwd_helpers_backend.py` and `_native_bwd_helpers_backend.cpp`
 - a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, the mixed packed/padded varlen layouts, and the public backward replay for dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod`
 
 It does **not** yet contain a verified native Windows FA4 runtime path.

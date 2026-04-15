@@ -19,6 +19,7 @@ from ._native_backend import _ensure_msvc_env
 _NATIVE_DENSE_MODULE: ModuleType | None = None
 _NATIVE_DENSE_ERROR: str | None = None
 _NATIVE_DENSE_LOCK = threading.Lock()
+_NATIVE_DENSE_LAST_CALL: str | None = None
 
 
 def _repo_root() -> Path:
@@ -75,7 +76,13 @@ def load_native_dense_backend(*, verbose: bool = False, force_rebuild: bool = Fa
                 for candidate in module_candidates:
                     candidate.unlink(missing_ok=True)
                 module_candidates = []
-            if not module_candidates:
+            newest_module = max(module_candidates, key=lambda path: path.stat().st_mtime) if module_candidates else None
+            source_mtime = max(
+                native_dense_source_path().stat().st_mtime,
+                native_dense_setup_path().stat().st_mtime,
+            )
+            needs_rebuild = newest_module is None or newest_module.stat().st_mtime < source_mtime
+            if needs_rebuild:
                 build_temp_dir = build_dir / "temp"
                 build_temp_dir.mkdir(parents=True, exist_ok=True)
                 cmd = [
@@ -136,6 +143,7 @@ def native_dense_backend_status() -> dict[str, object]:
         "loaded": module is not None,
         "module_file": getattr(module, "__file__", None) if module is not None else None,
         "error": _NATIVE_DENSE_ERROR,
+        "last_call": _NATIVE_DENSE_LAST_CALL,
     }
 
 
@@ -148,11 +156,12 @@ def flash_attn_dense_forward_native(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: tuple[int | None, int | None] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
     return_lse: bool = False,
     verbose_build: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if window_size != (None, None):
-        raise NotImplementedError("native dense backend only supports the no-window dense path")
+    global _NATIVE_DENSE_LAST_CALL
 
     backend = load_native_dense_backend(verbose=verbose_build)
     if backend is None:
@@ -160,7 +169,34 @@ def flash_attn_dense_forward_native(
         raise RuntimeError(f"native dense backend unavailable: {status['error']}")
 
     scale = float(softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5)
-    native_out, native_lse = backend.flash_attn_dense_forward(q, k, v, scale, bool(causal))
+    window_left = -1 if window_size[0] is None else int(window_size[0])
+    window_right = -1 if window_size[1] is None else int(window_size[1])
+    sink_arg: torch.Tensor | None = None
+    if learnable_sink is not None:
+        if learnable_sink.ndim != 1:
+            raise ValueError("learnable_sink must be a 1D tensor")
+        sink_arg = learnable_sink.contiguous()
+    native_out, native_lse = backend.flash_attn_dense_forward(
+        q,
+        k,
+        v,
+        scale,
+        bool(causal),
+        window_left,
+        window_right,
+        float(softcap),
+        sink_arg,
+    )
+    call_parts: list[str] = []
+    if softcap > 0.0:
+        call_parts.append("softcap")
+    if learnable_sink is not None:
+        call_parts.append("learnable_sink")
+    if window_size != (None, None):
+        call_parts.append("window")
+    if not call_parts:
+        call_parts.append("plain")
+    _NATIVE_DENSE_LAST_CALL = "+".join(call_parts)
 
     if out is None:
         out = native_out

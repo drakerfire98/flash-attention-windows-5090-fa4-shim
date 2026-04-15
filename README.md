@@ -34,6 +34,8 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/probe_native_fa4_forward.py`: native-path forward probe covering base dense attention, dense `softcap`, dense `mask_mod`, and varlen `softcap`
 - `scripts/probe_native_fa4_backward.py`: dense + varlen native-path backward parity probe against the stable Windows shim
 - `scripts/build_native_dense_backend.py`: rebuilds the compiled dense forward backend slice for the native FA4 bridge
+- `scripts/build_native_varlen_backend.py`: rebuilds the compiled varlen forward backend slice for the native FA4 bridge
+- `scripts/build_native_bwd_helpers_backend.py`: rebuilds the compiled backward preprocess/postprocess helper backend slice for the native FA4 bridge
 - `runtime_compat/`: installable Windows import-compat package that restores the old top-level `cuda` API shape and provides a discoverable `nvidia_cutlass_dsl` module name
 - `cutlass_runtime/`: installable top-level `cutlass` wrapper that promotes the repo's native probe package into a normal Windows import surface
 - `shims/`: repo-local compatibility shims used only for FA4 Windows probing
@@ -77,8 +79,13 @@ Current status:
 - the upstream forward-combine compile family now also resolves through a real `NativeProbeForwardCombineBridge`, with exact batched and varlen parity versus the stable Windows shim in the new combine probe
 - the forward-combine bridge now also handles `num_splits_dynamic_ptr`, with exact batched and varlen parity versus the stable Windows shim in the dynamic-split combine probe cases
 - the forward-combine bridge is now backed by a repo-built Windows extension module (`fa4_windows_native_combine_ext.cp313-win_amd64.pyd`) instead of the pure Python shim core
-- the plain batched dense forward family now also has a repo-built Windows extension module (`fa4_windows_native_dense_ext.cp313-win_amd64.pyd`) for the no-window, no-modifier path, and the native forward probe now reports `dense_backend=compiled`
+- the plain batched dense forward family now also has a repo-built Windows extension module (`fa4_windows_native_dense_ext.cp313-win_amd64.pyd`), and the native forward probe now reports `dense_backend=compiled`
+- the same dense compiled backend now also covers the tested local-window and `learnable_sink` dense cases exactly, and covers dense `softcap` with near-exact parity versus the stable Windows shim
+- the plain varlen forward family now also has a repo-built Windows extension module (`fa4_win_varlen_ext.cp313-win_amd64.pyd`), and the native probes now report `varlen_backend=compiled`
+- that compiled varlen backend now covers the tested mixed padded/packed layouts, `seqused_q` / `seqused_k`, and paged-KV no-modifier cases exactly against the stable Windows shim, while plain varlen `softcap` is currently near-exact
 - the dense backward replay path now also reuses that compiled dense backend for the same plain family before falling back to the validated shim path
+- the varlen backward replay path now also reuses that compiled varlen backend for the same no-modifier family before falling back to the validated shim path
+- the backward preprocess/postprocess helper family now also has a repo-built Windows extension module (`fa4_win_bwdh_ext.cp313-win_amd64.pyd`), and the native backward probe reports `last_op=postprocess_copy`
 - the upstream `compute_block_sparsity(...)` compile family now also resolves through a real `NativeProbeBlockSparsityBridge`, with exact parity versus the stable Windows shim for both exact and fast-sampling test cases
 - the forward bridge now also supports end-to-end block-sparse execution onto the stable Windows shim path
 - block sparsity with `num_splits > 1` no longer hard-fails on the repo-local overlay path; it now degrades to a compatible non-split execution path instead
@@ -89,7 +96,7 @@ Current status:
   - dense `learnable_sink` forward and backward parity are exact against the stable Windows shim
   - dense `mask_mod` forward and backward parity are exact against the stable Windows shim
   - dense block-sparse forward and backward parity are exact against the stable Windows shim through the public SM120 wrapper path
-  - varlen `softcap` forward parity is exact against the stable Windows shim
+  - varlen `softcap` forward parity is near-exact against the stable Windows shim
   - varlen `seqused_q` / `seqused_k` forward and backward parity are exact against the stable Windows shim
   - varlen `score_mod` forward parity is exact against the stable Windows shim
   - varlen `seqused_q` / `seqused_k` plus `score_mod` backward parity is exact against the stable Windows shim
@@ -110,7 +117,7 @@ Current native-probe import mode:
 - current observed probe mode is `runtime-local-core`
 - that means the Windows import surface is now exercising the repo's runtime-owned `cutlass` package and repo-owned `flash_attn.cute.interface` overlay directly; the remaining blocker is no longer legacy-root delegation, but the lack of a standalone native CuTe/CUTLASS DSL compiler/runtime behind `cutlass.cute.compile`
 
-The root native blocker is now pinned down more precisely than just "missing wheels". In `.venv_fa4`, the editable CUTLASS Python tree is present, but the newer FA4 stack expects a much larger CUTLASS DSL surface than that tree provides. The repo-local `cutlass_runtime/` package now owns the active `cutlass`, `cutlass.cute`, `cutlass.cutlass_dsl`, `cutlass.pipeline`, `cutlass.utils`, and `cutlass._mlir` import surfaces for the current native probe path, while `runtime_compat/` fixes the raw CUDA / `nvidia_cutlass_dsl` import mismatch directly and `flash_attn_runtime/` owns the active `flash_attn.cute` overlay. Recognized FA4 `cute.compile(...)` calls still resolve to bridge objects, but the forward-combine family and the plain batched dense forward family are now real compiled Windows backend slices through `fa4_windows_native_combine_ext` and `fa4_windows_native_dense_ext`, and the remaining bridge families still route onto the validated Windows shim path with exact or near-exact parity in the probes. That means the remaining blocker is no longer package discovery, a dead cubin hook, active `cutlass.*` leakage from `native_probe_shims`, or a live runtime dependency on an external `flash_attn.cute.interface` file. It is the absence of a full native CuTe DSL compiler/runtime path behind the rest of `cutlass.cute.compile` on this Windows stack. The current stable path is now a hybrid: two compiled Windows backend slices plus selective bridge objects for the rest of the FA4 surface.
+The root native blocker is now pinned down more precisely than just "missing wheels". In `.venv_fa4`, the editable CUTLASS Python tree is present, but the newer FA4 stack expects a much larger CUTLASS DSL surface than that tree provides. The repo-local `cutlass_runtime/` package now owns the active `cutlass`, `cutlass.cute`, `cutlass.cutlass_dsl`, `cutlass.pipeline`, `cutlass.utils`, and `cutlass._mlir` import surfaces for the current native probe path, while `runtime_compat/` fixes the raw CUDA / `nvidia_cutlass_dsl` import mismatch directly and `flash_attn_runtime/` owns the active `flash_attn.cute` overlay. Recognized FA4 `cute.compile(...)` calls still resolve to bridge objects, but the forward-combine family, the broader dense forward family, the broader plain varlen forward family, and the backward preprocess/postprocess helper family now have real compiled Windows backend slices through `fa4_windows_native_combine_ext`, `fa4_windows_native_dense_ext`, `fa4_win_varlen_ext`, and `fa4_win_bwdh_ext`, and the remaining bridge families still route onto the validated Windows shim path with exact or near-exact parity in the probes. That means the remaining blocker is no longer package discovery, a dead cubin hook, active `cutlass.*` leakage from `native_probe_shims`, or a live runtime dependency on an external `flash_attn.cute.interface` file. It is the absence of a full native CuTe DSL compiler/runtime path behind the rest of `cutlass.cute.compile` on this Windows stack. The current stable path is now a hybrid: multiple compiled Windows backend slices plus selective bridge objects for the rest of the FA4 surface.
 
 Current checkpoint caveat:
 
@@ -120,7 +127,9 @@ Current checkpoint caveat:
 - the compiled backend slices now live in:
   - `cutlass_runtime/src/cutlass/cute/_native_backend.py` and `_native_combine_backend.cpp`
   - `cutlass_runtime/src/cutlass/cute/_native_dense_backend.py` and `_native_dense_backend.cpp`
-  - with `scripts/build_native_combine_backend.py` and `scripts/build_native_dense_backend.py` available to rebuild the `.pyd` files
+  - `cutlass_runtime/src/cutlass/cute/_native_varlen_backend.py` and `_native_varlen_backend.cpp`
+  - `cutlass_runtime/src/cutlass/cute/_native_bwd_helpers_backend.py` and `_native_bwd_helpers_backend.cpp`
+  - with `scripts/build_native_combine_backend.py`, `scripts/build_native_dense_backend.py`, `scripts/build_native_varlen_backend.py`, and `scripts/build_native_bwd_helpers_backend.py` available to rebuild the `.pyd` files
 
 See `docs/FA4_WINDOWS_STATUS.md` for the exact attempted install path and blocker.
 

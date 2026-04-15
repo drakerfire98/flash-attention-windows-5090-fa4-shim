@@ -315,6 +315,44 @@ def _run_dense_learnable_sink(native_flash_attn_func, shim_mod):
     print(f"dense_learnable_sink_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
 
 
+def _run_dense_window(native_flash_attn_func, shim_mod):
+    torch.manual_seed(19)
+    q = torch.randn(1, 18, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 18, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 18, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    native_out, native_lse = native_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        window_size=(2, 3),
+        return_lse=True,
+    )
+    native_loss = native_out.float().sum() + 0.05 * native_lse.float().masked_fill(torch.isneginf(native_lse), 0.0).sum()
+    native_loss.backward()
+    native_grads = (q.grad.detach().clone(), k.grad.detach().clone(), v.grad.detach().clone())
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    ref_out, ref_lse = shim_mod.flash_attn_func(
+        q_ref,
+        k_ref,
+        v_ref,
+        causal=False,
+        window_size=(2, 3),
+        return_lse=True,
+    )
+    ref_loss = ref_out.float().sum() + 0.05 * ref_lse.float().masked_fill(torch.isneginf(ref_lse), 0.0).sum()
+    ref_loss.backward()
+    ref_grads = (q_ref.grad.detach().clone(), k_ref.grad.detach().clone(), v_ref.grad.detach().clone())
+
+    print("case=dense_window")
+    print(f"dense_window_out_max_diff={(native_out.float() - ref_out.float()).abs().max().item()}")
+    print(f"dense_window_grad_max_diff={_max_grad_diff(native_grads, ref_grads)}")
+    print(f"dense_window_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
+
+
 def _run_dense_mask_mod(native_flash_attn_func, shim_mod):
     torch.manual_seed(11)
     q = torch.randn(1, 20, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -721,7 +759,9 @@ def main() -> int:
     from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
     import flash_attn.cute.interface as iface
     from cutlass.cute._compile_bridge import compat_replay_varlen_backward
+    from cutlass.cute._native_bwd_helpers_backend import native_bwd_helpers_backend_status
     from cutlass.cute._native_dense_backend import native_dense_backend_status
+    from cutlass.cute._native_varlen_backend import native_varlen_backend_status
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the native backward probe")
@@ -730,11 +770,14 @@ def main() -> int:
     print(f"native_interface={interface_target}")
     print(f"loaded_interface={getattr(iface, '__file__', '<unknown>')}")
     print(f"native_dense_backend_pre={native_dense_backend_status()}")
+    print(f"native_varlen_backend_pre={native_varlen_backend_status()}")
+    print(f"native_bwd_helpers_backend_pre={native_bwd_helpers_backend_status()}")
     for runner in (
         lambda: _run_dense(flash_attn_func, shim_mod),
         lambda: _run_dense_deterministic(flash_attn_func, shim_mod),
         lambda: _run_dense_softcap(flash_attn_func, shim_mod),
         lambda: _run_dense_learnable_sink(flash_attn_func, shim_mod),
+        lambda: _run_dense_window(flash_attn_func, shim_mod),
         lambda: _run_dense_mask_mod(flash_attn_func, shim_mod),
         lambda: _run_dense_block_sparse(flash_attn_func, shim_mod),
         lambda: _run_varlen(flash_attn_varlen_func, shim_mod),
@@ -748,6 +791,8 @@ def main() -> int:
         _clear_compile_caches(iface)
         runner()
     print(f"native_dense_backend_post={native_dense_backend_status()}")
+    print(f"native_varlen_backend_post={native_varlen_backend_status()}")
+    print(f"native_bwd_helpers_backend_post={native_bwd_helpers_backend_status()}")
     return 0
 
 
