@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -91,7 +90,6 @@ def _make_seqlen_info(
     )
 
 
-@lru_cache(maxsize=None)
 def _resolve_mod_signature(mod: Callable, score_first: bool) -> str:
     try:
         signature = inspect.signature(mod)

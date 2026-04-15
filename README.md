@@ -47,6 +47,8 @@ Current status:
 - the shimmed varlen path was also cross-checked against FA2 behavior for unequal sequence lengths and matched closely
 - the shim now also supports `learnable_sink`
 - the shim now supports dense `mask_mod` fallbacks and varlen `score_mod` fallbacks, including global offset-aware `seqlen_info.offset_q` / `offset_k`
+- custom-mod validation now also covers backward parity for dense `mask_mod` and varlen `score_mod`
+- varlen validation also covers the aux-only `score_mod(..., aux_tensors)` callable form
 - the shim passes the broader validation matrix in `scripts/validate_fa4_windows_shim.py`
 
 The root native blocker is still that `nvidia-cutlass-dsl==4.4.2` installs only metadata in this environment and still requires `nvidia-cutlass-dsl-libs-base`, which does not currently resolve to a usable Windows package here. The current stable path is therefore a Windows compatibility shim layered on top of that gap, not a native FA4 kernel path.

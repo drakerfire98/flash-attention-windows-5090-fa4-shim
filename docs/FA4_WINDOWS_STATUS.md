@@ -108,10 +108,13 @@ Additional validation coverage now passes in `scripts/validate_fa4_windows_shim.
 
 - local window attention
 - dense `mask_mod`, including fully masked-row stability
+- dense `mask_mod` backward parity against the manual eager reference
 - MQA / GQA style KV head expansion
 - `learnable_sink`
 - varlen output / LSE reconstruction via chunked dense equivalence
 - varlen `score_mod`, including global offset-aware `seqlen_info.offset_k`
+- varlen `score_mod` backward parity against the manual eager reference
+- varlen aux-only `score_mod(..., aux_tensors)` callable form
 
 Varlen note:
 
