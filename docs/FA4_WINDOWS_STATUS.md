@@ -107,14 +107,19 @@ Dense-path verification is now stable:
 Additional validation coverage now passes in `scripts/validate_fa4_windows_shim.py`:
 
 - local window attention
+- dense `softcap`, including backward parity
 - dense `mask_mod`, including fully masked-row stability
 - dense `mask_mod` backward parity against the manual eager reference
+- dense `mask_mod` also validated for `info`-named seqlen modifier signatures
 - MQA / GQA style KV head expansion
 - `learnable_sink`
 - varlen output / LSE reconstruction via chunked dense equivalence
+- varlen `softcap`, including backward parity
+- varlen `seqused_k` truncation, including backward parity
 - varlen `score_mod`, including global offset-aware `seqlen_info.offset_k`
 - varlen `score_mod` backward parity against the manual eager reference
 - varlen aux-only `score_mod(..., aux_tensors)` callable form
+- varlen `score_mod` also validated for `info`-named seqlen modifier signatures
 
 Varlen note:
 

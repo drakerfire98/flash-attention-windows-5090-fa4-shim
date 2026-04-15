@@ -112,7 +112,7 @@ def _resolve_mod_signature(mod: Callable, score_first: bool) -> str:
         return "full"
     if len(positional_names) == base_arity + 1:
         last_name = positional_names[-1]
-        if "seq" in last_name or "offset" in last_name:
+        if "seq" in last_name or "offset" in last_name or "info" in last_name:
             return "seqlen"
         return "aux"
     if len(positional_names) == base_arity:
