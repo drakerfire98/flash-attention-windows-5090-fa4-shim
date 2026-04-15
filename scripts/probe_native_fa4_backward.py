@@ -36,6 +36,11 @@ def _mean_grad_diff(native: tuple[torch.Tensor, ...], ref: tuple[torch.Tensor, .
     return max((a.float() - b.float()).abs().mean().item() for a, b in zip(native, ref))
 
 
+def _striped_mask(batch_idx, head_idx, q_idx, kv_idx):
+    del batch_idx
+    return (kv_idx == 0) | ((kv_idx <= q_idx) & (((q_idx + kv_idx + head_idx) % 3) != 1))
+
+
 def _clear_compile_caches(iface) -> None:
     for attr_name in (
         "_flash_attn_fwd",
@@ -150,6 +155,63 @@ def _run_varlen_seqused(native_flash_attn_varlen_func, shim_mod):
     print(f"varlen_seqused_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
 
 
+def _run_dense_learnable_sink(native_flash_attn_func, shim_mod):
+    torch.manual_seed(13)
+    q = torch.randn(1, 18, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 18, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 18, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    sink = torch.tensor([0.25, -0.5], device="cuda", dtype=torch.bfloat16)
+    native_out, native_lse = native_flash_attn_func(
+        q, k, v, causal=True, return_lse=True, learnable_sink=sink
+    )
+    native_loss = native_out.float().sum() + 0.05 * native_lse.float().sum()
+    native_loss.backward()
+    native_grads = (q.grad.detach().clone(), k.grad.detach().clone(), v.grad.detach().clone())
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    ref_out, ref_lse = shim_mod.flash_attn_func(
+        q_ref, k_ref, v_ref, causal=True, return_lse=True, learnable_sink=sink
+    )
+    ref_loss = ref_out.float().sum() + 0.05 * ref_lse.float().sum()
+    ref_loss.backward()
+    ref_grads = (q_ref.grad.detach().clone(), k_ref.grad.detach().clone(), v_ref.grad.detach().clone())
+
+    print("case=dense_learnable_sink")
+    print(f"dense_learnable_sink_out_max_diff={(native_out.float() - ref_out.float()).abs().max().item()}")
+    print(f"dense_learnable_sink_grad_max_diff={_max_grad_diff(native_grads, ref_grads)}")
+    print(f"dense_learnable_sink_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
+
+
+def _run_dense_mask_mod(native_flash_attn_func, shim_mod):
+    torch.manual_seed(11)
+    q = torch.randn(1, 20, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 20, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 20, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    native_out, native_lse = native_flash_attn_func(
+        q, k, v, causal=False, return_lse=True, mask_mod=_striped_mask
+    )
+    native_loss = native_out.float().sum() + 0.05 * native_lse.float().masked_fill(torch.isneginf(native_lse), 0.0).sum()
+    native_loss.backward()
+    native_grads = (q.grad.detach().clone(), k.grad.detach().clone(), v.grad.detach().clone())
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    ref_out, ref_lse = shim_mod.flash_attn_func(
+        q_ref, k_ref, v_ref, causal=False, return_lse=True, mask_mod=_striped_mask
+    )
+    ref_loss = ref_out.float().sum() + 0.05 * ref_lse.float().masked_fill(torch.isneginf(ref_lse), 0.0).sum()
+    ref_loss.backward()
+    ref_grads = (q_ref.grad.detach().clone(), k_ref.grad.detach().clone(), v_ref.grad.detach().clone())
+
+    print("case=dense_mask_mod")
+    print(f"dense_mask_mod_out_max_diff={(native_out.float() - ref_out.float()).abs().max().item()}")
+    print(f"dense_mask_mod_grad_max_diff={_max_grad_diff(native_grads, ref_grads)}")
+    print(f"dense_mask_mod_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
+
+
 def _run_dense_softcap(native_flash_attn_func, shim_mod):
     torch.manual_seed(5)
     q = torch.randn(1, 12, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -247,6 +309,8 @@ def main() -> int:
     for runner in (
         lambda: _run_dense(flash_attn_func, shim_mod),
         lambda: _run_dense_softcap(flash_attn_func, shim_mod),
+        lambda: _run_dense_learnable_sink(flash_attn_func, shim_mod),
+        lambda: _run_dense_mask_mod(flash_attn_func, shim_mod),
         lambda: _run_varlen(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused_score_mod(flash_attn_varlen_func, shim_mod),

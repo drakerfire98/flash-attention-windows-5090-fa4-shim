@@ -17,6 +17,8 @@ from _probe_helpers import ProbePlaceholder
 _SHIM_MODULE: ModuleType | None = None
 _DLSE_BY_DQACCUM: dict[int, torch.Tensor | None] = {}
 _POSTPROCESS_RESULTS: dict[int, torch.Tensor] = {}
+_FWD_METADATA_BY_TENSOR_PTR: dict[int, dict[str, Any]] = {}
+_BWD_METADATA_BY_DQACCUM: dict[int, dict[str, Any]] = {}
 
 
 def _repo_root() -> Path:
@@ -71,6 +73,56 @@ def _convert_tensor_like(src: torch.Tensor | None, like: torch.Tensor | None) ->
 
 def _window_tuple(window_left: int | None, window_right: int | None) -> tuple[int | None, int | None]:
     return (window_left, window_right)
+
+
+def _tensor_ptr(tensor: torch.Tensor | None) -> int | None:
+    return None if tensor is None else int(tensor.data_ptr())
+
+
+def _stash_forward_metadata(
+    out: torch.Tensor | None,
+    lse: torch.Tensor | None,
+    *,
+    softcap: float,
+    score_mod: Any,
+    mask_mod: Any,
+    learnable_sink: torch.Tensor | None,
+    aux_tensors: list[torch.Tensor] | None,
+    page_table: torch.Tensor | None,
+) -> None:
+    keys = tuple(ptr for ptr in (_tensor_ptr(out), _tensor_ptr(lse)) if ptr is not None)
+    if not keys:
+        return
+    metadata = {
+        "cache_keys": keys,
+        "softcap": float(softcap),
+        "score_mod": score_mod,
+        "mask_mod": mask_mod,
+        "learnable_sink": learnable_sink,
+        "aux_tensors": aux_tensors,
+        "page_table": page_table,
+    }
+    for key in keys:
+        _FWD_METADATA_BY_TENSOR_PTR[key] = metadata
+
+
+def _pop_forward_metadata(out: torch.Tensor | None, lse: torch.Tensor | None) -> dict[str, Any] | None:
+    metadata = None
+    for key in (_tensor_ptr(out), _tensor_ptr(lse)):
+        if key is None:
+            continue
+        metadata = _FWD_METADATA_BY_TENSOR_PTR.get(key)
+        if metadata is not None:
+            break
+    if metadata is None:
+        return None
+    for key in metadata.get("cache_keys", ()):
+        _FWD_METADATA_BY_TENSOR_PTR.pop(key, None)
+    return {
+        name: value
+        for name, value in metadata.items()
+        if name != "cache_keys"
+    }
 
 
 def _extract_softcap_from_generated_score_mod(score_mod: Any) -> float | None:
@@ -182,6 +234,16 @@ class NativeProbeForwardBridge(JitCompiledFunction):
 
         _copy_tensor_like(out, shim_out)
         _copy_tensor_like(lse, shim_lse)
+        _stash_forward_metadata(
+            out,
+            lse,
+            softcap=softcap or 0.0,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            learnable_sink=learnable_sink,
+            aux_tensors=aux_tensors,
+            page_table=page_table,
+        )
 
 
 class NativeProbeBackwardPreprocessBridge(JitCompiledFunction):
@@ -200,7 +262,7 @@ class NativeProbeBackwardPreprocessBridge(JitCompiledFunction):
         seqused_q: torch.Tensor | None,
         dlse: torch.Tensor | None,
     ) -> None:
-        del out, dout, lse, cu_seqlens_q, seqused_q
+        del dout, cu_seqlens_q, seqused_q
         if dpsum is not None:
             dpsum.zero_()
         if lse_log2 is not None:
@@ -208,6 +270,9 @@ class NativeProbeBackwardPreprocessBridge(JitCompiledFunction):
         if dq_accum is not None:
             dq_accum.zero_()
             _DLSE_BY_DQACCUM[dq_accum.data_ptr()] = dlse.detach().clone() if dlse is not None else None
+            metadata = _pop_forward_metadata(out, lse)
+            if metadata is not None:
+                _BWD_METADATA_BY_DQACCUM[dq_accum.data_ptr()] = metadata
 
 
 class NativeProbeBackwardPostprocessBridge(JitCompiledFunction):
@@ -270,7 +335,10 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
 
         shim = _load_windows_shim_module()
         dlse = _DLSE_BY_DQACCUM.pop(dq_accum.data_ptr(), None)
+        compat_metadata = _BWD_METADATA_BY_DQACCUM.pop(dq_accum.data_ptr(), {})
         softcap_value = 0.0 if softcap is None else float(softcap)
+        if softcap_value == 0.0:
+            softcap_value = float(compat_metadata.get("softcap", 0.0) or 0.0)
 
         with torch.enable_grad():
             q_req = q.detach().clone().requires_grad_(True)
@@ -285,8 +353,12 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
             )
 
             is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k))
-            score_mod = getattr(self.kernel, "score_mod", None)
-            mask_mod = getattr(self.kernel, "mask_mod", None)
+            score_mod = getattr(self.kernel, "score_mod", None) or compat_metadata.get("score_mod")
+            mask_mod = getattr(self.kernel, "mask_mod", None) or compat_metadata.get("mask_mod")
+            learnable_sink = compat_metadata.get("learnable_sink")
+            if aux_tensors is None:
+                aux_tensors = compat_metadata.get("aux_tensors")
+            page_table = compat_metadata.get("page_table")
 
             if is_varlen:
                 shim_out, shim_lse = shim.flash_attn_varlen_func(
@@ -297,10 +369,10 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     cu_seqlens_k=cu_seqlens_k,
                     seqused_q=seqused_q,
                     seqused_k=seqused_k,
-                    page_table=None,
+                    page_table=page_table,
                     score_mod=score_mod,
                     aux_tensors=aux_tensors,
-                    learnable_sink=None,
+                    learnable_sink=learnable_sink,
                     softcap=softcap_value,
                     **common,
                 )
@@ -309,7 +381,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     q_req,
                     k_req,
                     v_req,
-                    learnable_sink=None,
+                    learnable_sink=learnable_sink,
                     softcap=softcap_value,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
@@ -324,7 +396,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     q_req,
                     k_req,
                     v_req,
-                    learnable_sink=None,
+                    learnable_sink=learnable_sink,
                     softcap=softcap_value,
                     mask_mod=mask_mod,
                     **common,

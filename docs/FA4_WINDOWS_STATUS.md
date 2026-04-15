@@ -211,6 +211,7 @@ Current probe result:
 - that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
 - recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
 - `scripts/probe_native_fa4_backward.py` now reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs in the current probe
+- the backward bridge now also preserves forward-only feature metadata across the preprocess step so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim
 - `scripts/patch_flash_attn_sm120_backward.py` now reapplies the local SM120 `dQ_single_wg = False` fix idempotently instead of relying on memory
 
 This is more real than the earlier placeholder probe, but it is still not native CuTe codegen yet.
@@ -239,24 +240,36 @@ Observed backward probe output:
 
 Observed widened modifier probe output:
 
+- dense `softcap` forward:
+  - output max diff vs stable shim: `0.0`
+  - LSE max diff vs stable shim: `0.0`
+- dense `softcap` backward:
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
+- dense `learnable_sink` backward:
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
 - dense `mask_mod` forward:
   - output max diff vs stable shim: `0.0`
   - LSE max diff vs stable shim: `0.0`
+- dense `mask_mod` backward:
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
 - varlen `softcap` forward:
   - output max diff vs stable shim: `0.0`
   - LSE max diff vs stable shim: `0.0`
-- dense `softcap` forward:
-  - output max diff vs stable shim: `0.06640625`
-  - LSE max diff vs stable shim: about `0.08098`
-- dense `softcap` backward:
-  - output max diff vs stable shim: `0.0234375`
-  - grad max diff vs stable shim: `0.01953125`
+- varlen `seqused_q` / `seqused_k` backward:
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
+- varlen `seqused_q` / `seqused_k` plus `score_mod` backward:
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
 
-So the modifier surface is now split cleanly:
+So the modifier surface is now much cleaner:
 
-- dense `mask_mod` is stable on the native probe bridge path
+- dense `softcap`, `learnable_sink`, and `mask_mod` are stable on the native probe bridge path in both forward and backward parity probes
 - varlen `softcap` is stable on the native probe bridge path
-- dense `softcap` still has residual drift and remains an honest next debugging target
+- varlen `seqused_q` / `seqused_k` and the mixed `seqused + score_mod` backward path are now also stable on the native probe bridge path
 
 That means the main forward path is no longer blocked by a dead placeholder for this recognized
 kernels. The next real missing piece is still a usable CuTe DSL compiler/runtime
