@@ -352,6 +352,9 @@ So the modifier surface is now much cleaner:
 - dense `softcap`, `learnable_sink`, and `mask_mod` are stable on the native probe bridge path in both forward and backward parity probes
 - varlen `softcap` is stable on the native probe bridge path
 - varlen `seqused_q` / `seqused_k` and the mixed `seqused + score_mod` backward path are now also stable on the native probe bridge path
+- varlen paged-KV is now stable on the native probe bridge path in both forward and backward parity probes
+- varlen `softcap + score_mod` is now stable on the native probe bridge path in both forward and backward parity probes
+- the internal varlen block-sparse path now reaches the native probe bridge exactly in forward parity probes, and the repo-local backward replay helper matches the stable shim exactly for the same tensors
 - the upstream forward-combine path is now also stable on the native probe bridge path for the tested batched and varlen cases
 - the upstream block-sparsity precompute path is now also stable on the native probe bridge path for the tested exact and fast-sampling cases
 
@@ -370,6 +373,7 @@ Checkpoint note:
 
 - the current backward checkpoint also relies on one local upstream source fix in `third_party/flash-attention-for-windows/flash_attn/cute/interface.py`
 - that fix initializes `dQ_single_wg = False` before the architecture branch so the SM120 backward path does not raise `UnboundLocalError`
+- the latest checkpoint also relies on local upstream compat patches in that same file so varlen paged-KV backward can replay through the repo-local shim helper instead of tripping `_flash_attn_bwd`'s dense shape assumptions
 
 ## Practical Meaning
 

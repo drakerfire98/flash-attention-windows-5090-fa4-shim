@@ -39,6 +39,40 @@ def main() -> None:
 
     patches = (
         (
+            "add softcap-plus-score_mod compatibility helper",
+            (
+                "from flash_attn.cute.block_sparsity import (\n"
+                "    BlockSparseTensorsTorch,\n"
+                "    to_cute_block_sparse_tensors,\n"
+                "    normalize_block_sparse_config,\n"
+                "    normalize_block_sparse_config_bwd,\n"
+                ")\n"
+            ),
+            (
+                "from flash_attn.cute.block_sparsity import (\n"
+                "    BlockSparseTensorsTorch,\n"
+                "    to_cute_block_sparse_tensors,\n"
+                "    normalize_block_sparse_config,\n"
+                "    normalize_block_sparse_config_bwd,\n"
+                ")\n"
+                "\n"
+                "def _windows_compose_softcap_scoremod(score_mod, softcap):\n"
+                "    if softcap is None:\n"
+                "        return score_mod\n"
+                "    if score_mod is None:\n"
+                "        return utils.create_softcap_scoremod(softcap)\n"
+                "    inv_softcap = 1.0 / softcap\n"
+                "\n"
+                "    @cute.jit\n"
+                "    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors):\n"
+                "        scores = score_mod(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors)\n"
+                "        scores = scores * inv_softcap\n"
+                "        return scores * cute.math.tanh(scores, fastmath=True)\n"
+                "\n"
+                "    return scoremod_premask_fn\n"
+            ),
+        ),
+        (
             "seed dQ_single_wg for the SM120 branch",
             (
                 "    causal, local, window_size_left, window_size_right = _resolve_causal_local_window(\n"
@@ -53,6 +87,18 @@ def main() -> None:
             ),
         ),
         (
+            "compose softcap with score_mod in the forward wrapper",
+            (
+                "    if softcap is not None:\n"
+                "        assert score_mod is None, \"softcap and score_mod cannot be used together\"\n"
+                "        score_mod = utils.create_softcap_scoremod(softcap)\n"
+            ),
+            (
+                "    if softcap is not None:\n"
+                "        score_mod = _windows_compose_softcap_scoremod(score_mod, softcap)\n"
+            ),
+        ),
+        (
             "remove the SM120 forward block-sparsity guard",
             (
                 "        elif arch // 10 == 12:\n"
@@ -64,6 +110,63 @@ def main() -> None:
                 "        elif arch // 10 == 12:\n"
                 "            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity\n"
                 "            assert page_table is None, \"Paged KV not supported on SM 12.0 in this PR\"\n"
+            ),
+        ),
+        (
+            "remove the SM120 forward paged-KV guard",
+            (
+                "        elif arch // 10 == 12:\n"
+                "            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity\n"
+                "            assert page_table is None, \"Paged KV not supported on SM 12.0 in this PR\"\n"
+                "            assert not is_split_kv, \"SplitKV not supported on SM 12.0 in this PR\"\n"
+            ),
+            (
+                "        elif arch // 10 == 12:\n"
+                "            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity\n"
+                "            assert not is_split_kv, \"SplitKV not supported on SM 12.0 in this PR\"\n"
+            ),
+        ),
+        (
+            "remove the varlen mask_mod forward guard",
+            (
+                "    if mask_mod is not None:\n"
+                "        if is_varlen:\n"
+                "            raise NotImplementedError(\n"
+                "                \"mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR.\"\n"
+                "            )\n"
+            ),
+            (
+                "    if mask_mod is not None:\n"
+                "        # Windows native probe path replays varlen mask_mod through the shim bridge.\n"
+                "        pass\n"
+            ),
+        ),
+        (
+            "stabilize the varlen mask_mod patched block",
+            (
+                "    if mask_mod is not None:\n"
+                "        # Windows native probe path replays varlen mask_mod through the shim bridge.\n"
+                "\n"
+            ),
+            (
+                "    if mask_mod is not None:\n"
+                "        # Windows native probe path replays varlen mask_mod through the shim bridge.\n"
+                "        pass\n"
+            ),
+        ),
+        (
+            "remove the varlen block-sparsity forward guard",
+            (
+                "    if use_block_sparsity:\n"
+                "        if is_varlen:\n"
+                "            raise NotImplementedError(\n"
+                "                \"Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR.\"\n"
+                "            )\n"
+                "        # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)\n"
+            ),
+            (
+                "    if use_block_sparsity:\n"
+                "        # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)\n"
             ),
         ),
         (
@@ -82,6 +185,112 @@ def main() -> None:
                 "        use_2cta_instrs = False\n"
                 "        num_threads = 128\n"
                 "        assert deterministic is False, \"deterministic backward not supported on SM 12.0\"\n"
+            ),
+        ),
+        (
+            "remove the varlen backward softcap guard",
+            (
+                "        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors\n"
+                "        assert ctx.softcap == 0.0\n"
+                "        if not ctx.return_lse:\n"
+            ),
+            (
+                "        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors\n"
+                "        if not ctx.return_lse:\n"
+            ),
+        ),
+        (
+            "save varlen compat metadata on the autograd context",
+            (
+                "        ctx.max_seqlen_q = max_seqlen_q\n"
+                "        ctx.max_seqlen_k = max_seqlen_k\n"
+                "        ctx.return_lse = return_lse\n"
+            ),
+            (
+                "        ctx.max_seqlen_q = max_seqlen_q\n"
+                "        ctx.max_seqlen_k = max_seqlen_k\n"
+                "        ctx.page_table = page_table\n"
+                "        ctx.score_mod = score_mod\n"
+                "        ctx.aux_tensors = aux_tensors\n"
+                "        ctx.learnable_sink = learnable_sink\n"
+                "        ctx.return_lse = return_lse\n"
+            ),
+        ),
+        (
+            "route paged varlen backward through the shim replay helper",
+            (
+                "        if dout is None:\n"
+                "            dout = torch.zeros_like(out)\n"
+                "        dq, dk, dv = _flash_attn_bwd(\n"
+                "            q,\n"
+                "            k,\n"
+                "            v,\n"
+                "            out,\n"
+                "            dout,\n"
+                "            lse,\n"
+                "            ctx.softmax_scale,\n"
+                "            ctx.causal,\n"
+                "            ctx.softcap,\n"
+                "            window_size_left=ctx.window_size[0],\n"
+                "            window_size_right=ctx.window_size[1],\n"
+                "            cu_seqlens_q=cu_seqlens_q,\n"
+                "            cu_seqlens_k=cu_seqlens_k,\n"
+                "            seqused_q=seqused_q,\n"
+                "            seqused_k=seqused_k,\n"
+                "            max_seqlen_q=ctx.max_seqlen_q,\n"
+                "            max_seqlen_k=ctx.max_seqlen_k,\n"
+                "            deterministic=ctx.deterministic,\n"
+                "            dlse=dlse,\n"
+                "        )\n"
+            ),
+            (
+                "        if dout is None:\n"
+                "            dout = torch.zeros_like(out)\n"
+                "        if getattr(ctx, \"page_table\", None) is not None:\n"
+                "            from cutlass.cute._compile_bridge import compat_replay_varlen_backward\n"
+                "\n"
+                "            dq, dk, dv = compat_replay_varlen_backward(\n"
+                "                q=q,\n"
+                "                k=k,\n"
+                "                v=v,\n"
+                "                dout=dout,\n"
+                "                dlse=dlse,\n"
+                "                cu_seqlens_q=cu_seqlens_q,\n"
+                "                cu_seqlens_k=cu_seqlens_k,\n"
+                "                seqused_q=seqused_q,\n"
+                "                seqused_k=seqused_k,\n"
+                "                page_table=ctx.page_table,\n"
+                "                softmax_scale=ctx.softmax_scale,\n"
+                "                causal=ctx.causal,\n"
+                "                window_size=ctx.window_size,\n"
+                "                learnable_sink=getattr(ctx, \"learnable_sink\", None),\n"
+                "                softcap=ctx.softcap,\n"
+                "                score_mod=getattr(ctx, \"score_mod\", None),\n"
+                "                aux_tensors=getattr(ctx, \"aux_tensors\", None),\n"
+                "                return_lse=ctx.return_lse,\n"
+                "            )\n"
+                "        else:\n"
+                "            dq, dk, dv = _flash_attn_bwd(\n"
+                "                q,\n"
+                "                k,\n"
+                "                v,\n"
+                "                out,\n"
+                "                dout,\n"
+                "                lse,\n"
+                "                ctx.softmax_scale,\n"
+                "                ctx.causal,\n"
+                "                ctx.softcap,\n"
+                "                window_size_left=ctx.window_size[0],\n"
+                "                window_size_right=ctx.window_size[1],\n"
+                "                cu_seqlens_q=cu_seqlens_q,\n"
+                "                cu_seqlens_k=cu_seqlens_k,\n"
+                "                seqused_q=seqused_q,\n"
+                "                seqused_k=seqused_k,\n"
+                "                max_seqlen_q=ctx.max_seqlen_q,\n"
+                "                max_seqlen_k=ctx.max_seqlen_k,\n"
+                "                deterministic=ctx.deterministic,\n"
+                "                dlse=dlse,\n"
+                "            )\n"
             ),
         ),
     )

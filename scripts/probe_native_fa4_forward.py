@@ -79,6 +79,53 @@ def _varlen_score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, seqlen_info):
     return scores + (head_idx.to(scores.dtype) * 0.02) + ((q_global - k_global).to(scores.dtype) * 0.01)
 
 
+def _varlen_softcap_score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, seqlen_info):
+    del batch_idx
+    q_global = q_idx + seqlen_info.offset_q
+    k_global = kv_idx + seqlen_info.offset_k
+    return (
+        scores
+        + (head_idx.to(scores.dtype) * 0.03)
+        + ((2 * q_global - k_global).to(scores.dtype) * 0.015)
+    )
+
+
+def _build_paged_kv_cache(
+    k_dense: torch.Tensor,
+    v_dense: torch.Tensor,
+    *,
+    page_size: int,
+    page_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_dense.shape != v_dense.shape:
+        raise ValueError("paged KV cache expects dense K and V to share the same shape")
+    if k_dense.ndim != 4:
+        raise ValueError("paged KV cache expects dense K and V shaped (batch, seqlen, heads, dim)")
+    batch, seqlen_k, num_heads, head_dim = k_dense.shape
+    if page_table.ndim != 2 or page_table.shape[0] != batch:
+        raise ValueError("page_table must be shaped (batch, max_num_pages_per_seq)")
+
+    num_pages = int(page_table.max().item()) + 1
+    k_paged = torch.zeros(
+        (num_pages, page_size, num_heads, head_dim),
+        device=k_dense.device,
+        dtype=k_dense.dtype,
+    )
+    v_paged = torch.zeros_like(k_paged)
+
+    for batch_idx in range(batch):
+        for page_offset in range(page_table.shape[1]):
+            page_idx = int(page_table[batch_idx, page_offset].item())
+            start = page_offset * page_size
+            if start >= seqlen_k:
+                continue
+            end = min(seqlen_k, start + page_size)
+            width = end - start
+            k_paged[page_idx, :width] = k_dense[batch_idx, start:end]
+            v_paged[page_idx, :width] = v_dense[batch_idx, start:end]
+    return k_paged, v_paged
+
+
 def _clear_compile_caches(iface) -> None:
     for attr_name in (
         "_flash_attn_fwd",
@@ -268,6 +315,151 @@ def _run_varlen_score_mod(native_flash_attn_varlen_func, shim_mod):
     _print_case_metrics("varlen_score_mod", native_out, ref_out, native_lse, ref_lse)
 
 
+def _run_varlen_paged_kv(native_flash_attn_varlen_func, shim_mod):
+    torch.manual_seed(43)
+    q = torch.randn(2, 6, 2, 16, device="cuda", dtype=torch.bfloat16)
+    k_dense = torch.randn(2, 8, 2, 16, device="cuda", dtype=torch.bfloat16)
+    v_dense = torch.randn(2, 8, 2, 16, device="cuda", dtype=torch.bfloat16)
+    page_table = torch.tensor([[2, 0], [1, 3]], device="cuda", dtype=torch.int32)
+    k_paged, v_paged = _build_paged_kv_cache(
+        k_dense,
+        v_dense,
+        page_size=4,
+        page_table=page_table,
+    )
+    seqused_q = torch.tensor([5, 6], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor([6, 7], device="cuda", dtype=torch.int32)
+
+    native_out, native_lse = native_flash_attn_varlen_func(
+        q,
+        k_paged,
+        v_paged,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        causal=True,
+        return_lse=True,
+    )
+    ref_out, ref_lse = shim_mod.flash_attn_varlen_func(
+        q,
+        k_paged,
+        v_paged,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        causal=True,
+        return_lse=True,
+    )
+    _print_case_metrics("varlen_paged_kv", native_out, ref_out, native_lse, ref_lse)
+
+
+def _run_varlen_softcap_score_mod(native_flash_attn_varlen_func, shim_mod):
+    torch.manual_seed(47)
+    lengths_q = [3, 4]
+    lengths_k = [5, 6]
+    q = torch.randn(sum(lengths_q), 2, 16, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lengths_k), 2, 16, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(sum(lengths_k), 2, 16, device="cuda", dtype=torch.bfloat16)
+    cu_q = torch.tensor([0, lengths_q[0], sum(lengths_q)], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, lengths_k[0], sum(lengths_k)], device="cuda", dtype=torch.int32)
+
+    native_out, native_lse = native_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        causal=True,
+        softcap=7.5,
+        score_mod=_varlen_softcap_score_mod,
+        return_lse=True,
+    )
+    ref_out, ref_lse = shim_mod.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        causal=True,
+        softcap=7.5,
+        score_mod=_varlen_softcap_score_mod,
+        return_lse=True,
+    )
+    _print_case_metrics(
+        "varlen_softcap_score_mod",
+        native_out,
+        ref_out,
+        native_lse,
+        ref_lse,
+    )
+
+
+def _run_varlen_block_sparse_internal(iface, shim_mod):
+    torch.manual_seed(53)
+    q = torch.randn(2, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(2, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+    seqused_q = torch.tensor([160, 256], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor([192, 256], device="cuda", dtype=torch.int32)
+
+    def striped_block_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        del batch_idx, head_idx, seqlen_info, aux_tensors
+        return (kv_idx <= q_idx) & (((q_idx + kv_idx) % 3) != 1)
+
+    _, sparse_tensors = shim_mod.compute_block_sparsity(
+        128,
+        128,
+        2,
+        1,
+        256,
+        256,
+        striped_block_mask,
+        None,
+        torch.device("cuda"),
+        compute_full_blocks=True,
+    )
+
+    native_out, native_lse = iface._flash_attn_fwd(
+        q,
+        k,
+        v,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        causal=False,
+        mask_mod=striped_block_mask,
+        block_sparse_tensors=sparse_tensors,
+        return_lse=True,
+    )
+    ref_out, ref_lse = shim_mod._attention_forward_varlen_block_sparse(
+        q,
+        k,
+        v,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        softmax_scale=None,
+        causal=False,
+        window_size=(None, None),
+        learnable_sink=None,
+        softcap=0.0,
+        score_mod=None,
+        mask_mod=striped_block_mask,
+        full_block_cnt=sparse_tensors.full_block_cnt,
+        full_block_idx=sparse_tensors.full_block_idx,
+        mask_block_cnt=sparse_tensors.mask_block_cnt,
+        mask_block_idx=sparse_tensors.mask_block_idx,
+        block_size=sparse_tensors.block_size,
+        aux_tensors=None,
+        return_lse=True,
+    )
+    _print_case_metrics(
+        "varlen_block_sparse_internal",
+        native_out,
+        ref_out,
+        native_lse,
+        ref_lse,
+    )
+
+
 def _run_varlen_seqused_score_mod(native_flash_attn_varlen_func, shim_mod):
     torch.manual_seed(37)
     seqused_q = torch.tensor([3, 4], device="cuda", dtype=torch.int32)
@@ -341,6 +533,9 @@ def main() -> int:
         lambda: _run_varlen_seqused(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_score_mod(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused_score_mod(flash_attn_varlen_func, shim_mod),
+        lambda: _run_varlen_paged_kv(flash_attn_varlen_func, shim_mod),
+        lambda: _run_varlen_softcap_score_mod(flash_attn_varlen_func, shim_mod),
+        lambda: _run_varlen_block_sparse_internal(iface, shim_mod),
     ):
         _clear_compile_caches(iface)
         runner()
