@@ -1,28 +1,11 @@
-"""CUTLASS utils wrapper for native FA4 import probing."""
+"""Local CUTLASS utils compatibility surface for Windows FA4 probing."""
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 
-
-_SHIM_DIR = Path(__file__).resolve().parent
-_WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
-_REAL_PYTHON_ROOT = (
-    _WORKSPACE_ROOT / "third_party" / "flash-attention-for-windows" / "csrc" / "cutlass" / "python"
-)
-_REAL_PACKAGE_DIR = _REAL_PYTHON_ROOT / "cutlass" / "utils"
-_REAL_INIT = _REAL_PACKAGE_DIR / "__init__.py"
-
-if str(_REAL_PYTHON_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REAL_PYTHON_ROOT))
-
-__path__ = [str(_SHIM_DIR), str(_REAL_PACKAGE_DIR)]
-__file__ = str(_REAL_INIT)
-
-exec(compile(_REAL_INIT.read_text(encoding="utf-8"), __file__, "exec"), globals())
+from _probe_helpers import module_getattr
 
 
 class LayoutEnum(Enum):
@@ -35,10 +18,10 @@ class LayoutEnum(Enum):
         return cls.ROW_MAJOR
 
     def is_m_major_c(self):
-        return True
+        return self is type(self).ROW_MAJOR
 
     def is_n_major_c(self):
-        return False
+        return self is type(self).COLUMN_MAJOR
 
 
 class HardwareInfo:
@@ -68,6 +51,41 @@ class WorkTileInfo:
     is_valid: object
 
 
+def alignment_or_default(*args, **kwargs):
+    del args, kwargs
+    return 1
+
+
+def calculate_smem_usage(*args, **kwargs):
+    del args, kwargs
+    return 0
+
+
+def calculate_smem_usage_per_stage(*args, **kwargs):
+    del args, kwargs
+    return 0
+
+
+def valid_cluster_shape(*args, **kwargs):
+    del args, kwargs
+    return True
+
+
+def valid_schedule(*args, **kwargs):
+    del args, kwargs
+    return True
+
+
+def valid_stage_count(*args, **kwargs):
+    del args, kwargs
+    return True
+
+
+def update_alignment(*args, **kwargs):
+    del args, kwargs
+    return None
+
+
 def get_smem_capacity_in_bytes(arch):
     del arch
     return 0
@@ -77,3 +95,23 @@ def get_num_tmem_alloc_cols(tensor):
     del tensor
     return 0
 
+
+__all__ = [
+    "HardwareInfo",
+    "LayoutEnum",
+    "SmemAllocator",
+    "TensorMapManager",
+    "TmemAllocator",
+    "WorkTileInfo",
+    "alignment_or_default",
+    "calculate_smem_usage",
+    "calculate_smem_usage_per_stage",
+    "get_num_tmem_alloc_cols",
+    "get_smem_capacity_in_bytes",
+    "update_alignment",
+    "valid_cluster_shape",
+    "valid_schedule",
+    "valid_stage_count",
+]
+
+__getattr__ = module_getattr("cutlass.utils")

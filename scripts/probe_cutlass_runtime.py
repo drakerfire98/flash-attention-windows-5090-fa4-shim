@@ -70,7 +70,7 @@ def main() -> int:
     print(f"raw_cutlass_dist={_dist_version('cutlass')}")
     print(f"raw_nvidia_cutlass_dsl_dist={_dist_version('nvidia-cutlass-dsl')}")
     print(f"nvidia_cutlass_dsl_requires={_dist_requires('nvidia-cutlass-dsl')}")
-    sys.path.insert(0, str(repo_root / "native_probe_shims"))
+    sys.path.insert(0, str(repo_root / "cutlass_runtime" / "src"))
 
     import cutlass
     import cutlass.cute as cute
@@ -86,6 +86,7 @@ def main() -> int:
     print(f"cute_file={getattr(cute, '__file__', '<missing>')}")
     print(f"cute_compile_type={type(getattr(cute, 'compile', None)).__name__}")
     print(f"cute_compile_repr={repr(getattr(cute, 'compile', None))}")
+    print(f"pycute_loaded={'pycute' in sys.modules}")
 
     runtime_cuda = getattr(getattr(getattr(cutlass, "base_dsl", None), "runtime", None), "cuda", None)
     load_cubin = getattr(runtime_cuda, "load_cubin_module_data", None)
@@ -103,8 +104,12 @@ def main() -> int:
         blockers.append("cuda.bindings.driver binary runtime is not importable")
     if raw_cuda_import != "ok":
         blockers.append("top-level cuda package does not expose the modern runtime surface directly")
-    if getattr(cutlass, "NATIVE_PROBE_MODE", None) != "modern-cutlass-package":
+    if getattr(cutlass, "NATIVE_PROBE_MODE", None) not in {"modern-cutlass-package", "runtime-local-core"}:
         blockers.append("native probe still requires legacy-editable CUTLASS plus shims")
+    if "pycute" in sys.modules:
+        blockers.append("cutlass.cute still imported external pycute")
+    if "cutlass_runtime\\src\\cutlass\\cute\\__init__.py" not in str(getattr(cute, "__file__", "")).lower():
+        blockers.append("cutlass.cute is not resolving from the repo-local runtime package")
     print(f"modern_runtime_ready={len(blockers) == 0}")
     print(f"modern_runtime_blockers={blockers}")
     return 0

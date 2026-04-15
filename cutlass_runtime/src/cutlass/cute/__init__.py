@@ -1,13 +1,22 @@
 """Repo-local CuTe compatibility surface for native FA4 probing on Windows.
 
-This deliberately avoids importing the external legacy ``pycute`` package
-directly. The goal is to keep the import/runtime surface self-owned inside the
-repo while still routing recognized kernels through the compile bridge.
+This package lives under ``cutlass_runtime/src`` so the runtime owns the
+``cutlass.cute`` import directly. Submodules that we have not internalized yet
+can still fall through to the repo-local probe implementation via
+``__path__``.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
+
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _PACKAGE_DIR.parents[4]
+_NATIVE_PROBE_CUTE_DIR = _REPO_ROOT / "native_probe_shims" / "cutlass" / "cute"
+
+__path__ = [str(_PACKAGE_DIR), str(_NATIVE_PROBE_CUTE_DIR)]  # type: ignore[assignment]
 
 from _probe_helpers import ProbePlaceholder, module_getattr, passthrough_decorator
 from ._compile_bridge import compile_dispatch
