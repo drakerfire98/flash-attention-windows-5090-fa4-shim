@@ -136,7 +136,11 @@ def main() -> int:
         blockers.append("cuda.bindings.driver binary runtime is not importable")
     if raw_cuda_import != "ok":
         blockers.append("top-level cuda package does not expose the modern runtime surface directly")
-    if getattr(cutlass, "NATIVE_PROBE_MODE", None) not in {"modern-cutlass-package", "runtime-local-core"}:
+    if getattr(cutlass, "NATIVE_PROBE_MODE", None) not in {
+        "modern-cutlass-package",
+        "runtime-local-core",
+        "runtime-local-owned",
+    }:
         blockers.append("native probe still requires legacy-editable CUTLASS plus shims")
     if "pycute" in sys.modules:
         blockers.append("cutlass.cute still imported external pycute")

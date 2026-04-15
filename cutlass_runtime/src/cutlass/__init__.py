@@ -18,10 +18,9 @@ from _probe_helpers import ProbePlaceholder, try_dist_version
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _PACKAGE_DIR.parents[2]
-_NATIVE_PROBE_CUTLASS_DIR = _REPO_ROOT / "native_probe_shims" / "cutlass"
 _CUDA_COMPAT_INIT = _REPO_ROOT / "runtime_compat" / "src" / "cuda" / "__init__.py"
 
-__path__ = [str(_PACKAGE_DIR), str(_NATIVE_PROBE_CUTLASS_DIR)]  # type: ignore[assignment]
+__path__ = [str(_PACKAGE_DIR)]  # type: ignore[assignment]
 
 
 def _ensure_probe_cuda_shim_loaded() -> None:
@@ -50,7 +49,7 @@ def _ensure_probe_cuda_shim_loaded() -> None:
 
 _ensure_probe_cuda_shim_loaded()
 
-NATIVE_PROBE_MODE = "runtime-local-core"
+NATIVE_PROBE_MODE = "runtime-local-owned"
 NATIVE_PROBE_CUTLASS_INIT = str(Path(__file__).resolve())
 NATIVE_PROBE_RUNTIME_OWNED_MODULES = (
     "cutlass",
@@ -73,7 +72,7 @@ NATIVE_PROBE_RUNTIME_OWNED_MODULES = (
     "cutlass._mlir.dialects.nvvm",
     "cutlass._mlir.dialects.vector",
 )
-NATIVE_PROBE_FALLBACK_ROOTS = (str(_NATIVE_PROBE_CUTLASS_DIR),)
+NATIVE_PROBE_FALLBACK_ROOTS = ()
 NATIVE_PROBE_DIST_VERSIONS = {
     "cutlass": try_dist_version("cutlass"),
     "nvidia-cutlass-dsl": try_dist_version("nvidia-cutlass-dsl"),
@@ -81,8 +80,9 @@ NATIVE_PROBE_DIST_VERSIONS = {
 NATIVE_PROBE_REASON = (
     "Using the repo-local cutlass_runtime root package and runtime-owned "
     "CUTLASS compatibility subpackages instead of the legacy editable "
-    "CUTLASS root. The native_probe_shims tree remains only as a fallback "
-    "for unimplemented modules."
+    "CUTLASS root. The tested probe path now resolves entirely through the "
+    "runtime-owned package surface without loading cutlass modules from "
+    "native_probe_shims."
 )
 
 

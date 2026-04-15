@@ -20,6 +20,10 @@ from ._native_dense_bwd_backend import (
 )
 from ._native_dense_backend import flash_attn_dense_forward_native, native_dense_backend_status
 from ._native_varlen_backend import flash_attn_varlen_forward_native, native_varlen_backend_status
+from ._native_varlen_bwd_backend import (
+    flash_attn_varlen_backward_native,
+    native_varlen_bwd_backend_status,
+)
 from ._runtime_local_core import (
     attention_forward_dense_local,
     attention_forward_varlen_local,
@@ -89,12 +93,14 @@ def _can_use_native_varlen_backend(
     score_mod: Any,
     mask_mod: Any,
     block_sparse_tensors: Any,
+    softcap: float | None,
 ) -> bool:
     return (
         is_varlen
         and score_mod is None
         and mask_mod is None
         and block_sparse_tensors is None
+        and (softcap is None or float(softcap) == 0.0)
     )
 
 
@@ -258,50 +264,52 @@ def _run_forward_with_bridge_runtime(
                 block_sparse_tensors=block_sparse_tensors,
                 block_size=block_size,
             )
-            try:
-                return (
-                    *flash_attn_varlen_forward_native(
-                        q,
-                        k,
-                        v,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_k=cu_seqlens_k,
-                        seqused_q=seqused_q,
-                        seqused_k=seqused_k,
-                        page_table=page_table,
-                        softmax_scale=softmax_scale,
-                        causal=causal,
-                        window_size=window_size,
-                        learnable_sink=learnable_sink,
-                        extra_keep_mask=extra_keep_mask,
-                        softcap=softcap,
-                        return_lse=return_lse,
-                    ),
-                    block_size,
-                )
-            except Exception:
-                shim_out, shim_lse = attention_forward_varlen_local(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    seqused_q=seqused_q,
-                    seqused_k=seqused_k,
-                    page_table=page_table,
-                    softmax_scale=softmax_scale,
-                    causal=causal,
-                    window_size=window_size,
-                    learnable_sink=learnable_sink,
-                    softcap=softcap,
-                    score_mod=None,
-                    mask_mod=mask_mod,
-                    aux_tensors=aux_tensors,
-                    block_sparse_tensors=block_sparse_tensors,
-                    block_size=block_size,
-                    return_lse=return_lse,
-                )
-                return shim_out, shim_lse, block_size
+            if float(softcap) == 0.0:
+                try:
+                    return (
+                        *flash_attn_varlen_forward_native(
+                            q,
+                            k,
+                            v,
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_k=cu_seqlens_k,
+                            seqused_q=seqused_q,
+                            seqused_k=seqused_k,
+                            page_table=page_table,
+                            softmax_scale=softmax_scale,
+                            causal=causal,
+                            window_size=window_size,
+                            learnable_sink=learnable_sink,
+                            extra_keep_mask=extra_keep_mask,
+                            softcap=softcap,
+                            return_lse=return_lse,
+                        ),
+                        block_size,
+                    )
+                except Exception:
+                    pass
+            shim_out, shim_lse = attention_forward_varlen_local(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                page_table=page_table,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                softcap=softcap,
+                score_mod=None,
+                mask_mod=mask_mod,
+                aux_tensors=aux_tensors,
+                block_sparse_tensors=block_sparse_tensors,
+                block_size=block_size,
+                return_lse=return_lse,
+            )
+            return shim_out, shim_lse, block_size
 
         extra_keep_mask = materialize_dense_keep_mask(
             q,
@@ -356,6 +364,7 @@ def _run_forward_with_bridge_runtime(
         score_mod=score_mod,
         mask_mod=mask_mod,
         block_sparse_tensors=block_sparse_tensors,
+        softcap=softcap,
     ):
         try:
             return (
@@ -719,13 +728,15 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
         dense_status = native_dense_backend_status()
         dense_bwd_status = native_dense_bwd_backend_status()
         varlen_status = native_varlen_backend_status()
+        varlen_bwd_status = native_varlen_bwd_backend_status()
         dense_backend = "compiled" if dense_status.get("loaded") else "fallback"
         dense_bwd_backend = "compiled" if dense_bwd_status.get("loaded") else "fallback"
         varlen_backend = "compiled" if varlen_status.get("loaded") else "fallback"
+        varlen_bwd_backend = "compiled" if varlen_bwd_status.get("loaded") else "fallback"
         return (
             f"<NativeProbeBackwardBridge {self.kernel_name} "
             f"dense_backend={dense_backend} dense_bwd_backend={dense_bwd_backend} "
-            f"varlen_backend={varlen_backend}>"
+            f"varlen_backend={varlen_backend} varlen_bwd_backend={varlen_bwd_backend}>"
         )
 
     def __call__(
@@ -789,7 +800,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     "Block-sparse native probe backward bridge is missing the original block size metadata"
                 )
             is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table))
-            if not is_varlen and score_mod is None and float(softcap_value) == 0.0:
+            if not is_varlen and score_mod is None:
                 extra_keep_mask = None
                 if mask_mod is not None or block_sparse_tensors is not None:
                     extra_keep_mask = materialize_dense_keep_mask(
@@ -823,7 +834,68 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                         window_size=window_size,
                         learnable_sink=learnable_sink,
                         extra_keep_mask=extra_keep_mask,
-                        softcap=0.0,
+                        softcap=softcap_value,
+                    )
+                    _POSTPROCESS_RESULTS[dq_accum.data_ptr()] = dq_grad.detach()
+                    qhead_per_kvhead = int(getattr(self.kernel, "qhead_per_kvhead", 1))
+                    if qhead_per_kvhead > 1:
+                        _POSTPROCESS_RESULTS[dk_or_accum.data_ptr()] = dk_grad.detach()
+                        _POSTPROCESS_RESULTS[dv_or_accum.data_ptr()] = dv_grad.detach()
+                    else:
+                        _copy_tensor_like(dk_or_accum, dk_grad.detach())
+                        _copy_tensor_like(dv_or_accum, dv_grad.detach())
+                    return
+                except Exception:
+                    pass
+            if is_varlen and score_mod is None:
+                extra_keep_mask = None
+                if mask_mod is not None or block_sparse_tensors is not None:
+                    extra_keep_mask = materialize_varlen_keep_mask(
+                        q_req,
+                        k_req,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        seqused_q=seqused_q,
+                        seqused_k=seqused_k,
+                        page_table=page_table,
+                        mask_mod=mask_mod,
+                        aux_tensors=aux_tensors,
+                        block_sparse_tensors=block_sparse_tensors,
+                        block_size=compat_block_size,
+                    )
+                dlse_native = None
+                if dlse is not None:
+                    if cu_seqlens_q is not None:
+                        expected_lse = torch.empty(
+                            (q.shape[0], q.shape[1]),
+                            device=dlse.device,
+                            dtype=dlse.dtype,
+                        )
+                    else:
+                        expected_lse = torch.empty(
+                            (q.shape[0], q.shape[1], q.shape[2]),
+                            device=dlse.device,
+                            dtype=dlse.dtype,
+                        )
+                    dlse_native = _convert_tensor_like(dlse, expected_lse)
+                try:
+                    dq_grad, dk_grad, dv_grad = flash_attn_varlen_backward_native(
+                        q_req,
+                        k_req,
+                        v_req,
+                        dout,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        seqused_q=seqused_q,
+                        seqused_k=seqused_k,
+                        page_table=page_table,
+                        dlse=dlse_native,
+                        softmax_scale=softmax_scale,
+                        causal=bool(getattr(self.kernel, "is_causal", False)),
+                        window_size=window_size,
+                        learnable_sink=learnable_sink,
+                        extra_keep_mask=extra_keep_mask,
+                        softcap=softcap_value,
                     )
                     _POSTPROCESS_RESULTS[dq_accum.data_ptr()] = dq_grad.detach()
                     qhead_per_kvhead = int(getattr(self.kernel, "qhead_per_kvhead", 1))

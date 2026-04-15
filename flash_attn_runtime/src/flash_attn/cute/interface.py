@@ -308,9 +308,9 @@ def _flash_attn_fwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: Optional[float] = None,
@@ -986,6 +986,7 @@ def _flash_attn_bwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     deterministic: bool = False,
@@ -996,9 +997,11 @@ def _flash_attn_bwd(
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del learnable_sink
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
@@ -1052,6 +1055,7 @@ def _flash_attn_bwd(
             or cu_seqlens_k is not None
             or seqused_q is not None
             or seqused_k is not None
+            or page_table is not None
         )
     else:
         m_block_size = 128
@@ -1081,8 +1085,13 @@ def _flash_attn_bwd(
         seqlen_q = max_seqlen_q if max_seqlen_q is not None else total_q
 
     if cu_seqlens_k is None:
-        batch_size, seqlen_k = k.shape[:2]
-        total_k = batch_size * seqlen_k
+        if page_table is None:
+            batch_size, seqlen_k = k.shape[:2]
+            total_k = batch_size * seqlen_k
+        else:
+            batch_size = page_table.shape[0]
+            seqlen_k = page_table.shape[1] * k.shape[1]
+            total_k = batch_size * seqlen_k
     else:
         batch_size = cu_seqlens_k.shape[0] - 1
         total_k = k.shape[0]
@@ -1108,8 +1117,16 @@ def _flash_attn_bwd(
         seqlen_k_rounded = seqlen_k_rounded + n_block_size
 
     if cu_seqlens_k is None:
-        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        if page_table is None:
+            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+            assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        else:
+            assert page_table.dtype == torch.int32, "page_table must be int32"
+            assert page_table.shape[0] == batch_size
+            assert k.dim() == 4 and v.dim() == 4
+            assert k.shape[1] * page_table.shape[1] == seqlen_k
+            assert k.shape[2] == num_head_kv and v.shape[2] == num_head_kv
+            assert k.shape[3] == head_dim and v.shape[3] == head_dim_v
     else:
         assert k.shape == (total_k, num_head_kv, head_dim)
         assert v.shape == (total_k, num_head_kv, head_dim_v)
@@ -1369,6 +1386,7 @@ def _flash_attn_bwd(
             cu_seqlens_k is None,
             seqused_q is None,
             seqused_k is None,
+            page_table is None,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1720,53 +1738,31 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dlse = None
         if dout is None:
             dout = torch.zeros_like(out)
-        if getattr(ctx, "page_table", None) is not None:
-            from cutlass.cute._compile_bridge import compat_replay_varlen_backward
-
-            dq, dk, dv = compat_replay_varlen_backward(
-                q=q,
-                k=k,
-                v=v,
-                dout=dout,
-                dlse=dlse,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                page_table=ctx.page_table,
-                softmax_scale=ctx.softmax_scale,
-                causal=ctx.causal,
-                window_size=ctx.window_size,
-                learnable_sink=getattr(ctx, "learnable_sink", None),
-                softcap=ctx.softcap,
-                score_mod=getattr(ctx, "score_mod", None),
-                aux_tensors=getattr(ctx, "aux_tensors", None),
-                return_lse=ctx.return_lse,
-            )
-        else:
-            dq, dk, dv = _flash_attn_bwd(
-                q,
-                k,
-                v,
-                out,
-                dout,
-                lse,
-                ctx.softmax_scale,
-                ctx.causal,
-                ctx.softcap,
-                window_size_left=ctx.window_size[0],
-                window_size_right=ctx.window_size[1],
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                max_seqlen_q=ctx.max_seqlen_q,
-                max_seqlen_k=ctx.max_seqlen_k,
-                deterministic=ctx.deterministic,
-                score_mod=getattr(ctx, "score_mod", None),
-                aux_tensors=getattr(ctx, "aux_tensors", None),
-                dlse=dlse,
-            )
+        dq, dk, dv = _flash_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.softcap,
+            window_size_left=ctx.window_size[0],
+            window_size_right=ctx.window_size[1],
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=getattr(ctx, "page_table", None),
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
+            deterministic=ctx.deterministic,
+            score_mod=getattr(ctx, "score_mod", None),
+            aux_tensors=getattr(ctx, "aux_tensors", None),
+            learnable_sink=getattr(ctx, "learnable_sink", None),
+            dlse=dlse,
+        )
 
         return dq, dk, dv, *((None,) * 20)
 
