@@ -125,9 +125,13 @@ def _manual_safe_probs_and_lse(scores: torch.Tensor) -> tuple[torch.Tensor, torc
 def _manual_combine_ref(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
+    *,
+    split_valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     lse_float = lse_partial.float()
     valid = ~torch.isneginf(lse_float)
+    if split_valid_mask is not None:
+        valid = valid & split_valid_mask
     any_valid = valid.any(dim=0)
     lse_max = torch.amax(lse_float, dim=0)
     safe_lse_max = torch.where(any_valid, lse_max, torch.zeros_like(lse_max))
@@ -149,6 +153,52 @@ def _manual_combine_ref(
         torch.full_like(safe_lse_max, float("-inf")),
     )
     return out, lse
+
+
+def _manual_batched_dynamic_split_mask(
+    *,
+    num_splits: int,
+    batch_size: int,
+    seqlen_q: int,
+    num_heads: int,
+    seqused: torch.Tensor,
+    num_splits_dynamic_ptr: torch.Tensor,
+) -> torch.Tensor:
+    split_ids = torch.arange(num_splits, device=seqused.device, dtype=torch.long).view(num_splits, 1, 1, 1)
+    split_valid = split_ids < num_splits_dynamic_ptr.to(torch.long).view(1, batch_size, 1, 1)
+    q_ids = torch.arange(seqlen_q, device=seqused.device, dtype=torch.long).view(1, seqlen_q, 1)
+    seq_valid = q_ids < seqused.to(torch.long).view(batch_size, 1, 1)
+    return (split_valid & seq_valid.view(1, batch_size, seqlen_q, 1)).expand(
+        num_splits,
+        batch_size,
+        seqlen_q,
+        num_heads,
+    )
+
+
+def _manual_varlen_dynamic_split_mask(
+    *,
+    num_splits: int,
+    total_q: int,
+    num_heads: int,
+    cu_seqlens: torch.Tensor,
+    seqused: torch.Tensor,
+    num_splits_dynamic_ptr: torch.Tensor,
+    varlen_batch_idx: torch.Tensor,
+) -> torch.Tensor:
+    split_valid = torch.zeros((num_splits, total_q, num_heads), device=cu_seqlens.device, dtype=torch.bool)
+    split_ids = torch.arange(num_splits, device=cu_seqlens.device, dtype=torch.long).view(num_splits, 1, 1)
+    for virtual_batch in range(int(cu_seqlens.numel() - 1)):
+        start = int(cu_seqlens[virtual_batch].item())
+        end = int(cu_seqlens[virtual_batch + 1].item())
+        real_batch = int(varlen_batch_idx[virtual_batch].item())
+        used = min(end - start, max(0, int(seqused[real_batch].item())))
+        if used <= 0:
+            continue
+        valid_end = start + used
+        split_count = int(num_splits_dynamic_ptr[real_batch].item())
+        split_valid[:, start:valid_end] = split_ids < split_count
+    return split_valid
 
 
 def _manual_mask_mod_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -491,6 +541,66 @@ def main() -> int:
     _assert_close("combine_varlen_out", out, ref_out, atol=0.0, rtol=0.0)
     _assert_close("combine_varlen_lse", lse, ref_lse, atol=0.0, rtol=0.0)
 
+    out_partial = torch.randn(4, 2, 5, 3, 8, device="cuda", dtype=torch.bfloat16)
+    lse_partial = torch.randn(4, 2, 5, 3, device="cuda", dtype=torch.float32)
+    lse_partial[:, 1, 4, :] = float("-inf")
+    seqused = torch.tensor([3, 5], device="cuda", dtype=torch.int32)
+    dynamic_splits = torch.tensor([2, 4], device="cuda", dtype=torch.int32)
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        seqused=seqused,
+        num_splits_dynamic_ptr=dynamic_splits,
+        return_lse=True,
+    )
+    split_valid_mask = _manual_batched_dynamic_split_mask(
+        num_splits=4,
+        batch_size=2,
+        seqlen_q=5,
+        num_heads=3,
+        seqused=seqused,
+        num_splits_dynamic_ptr=dynamic_splits,
+    )
+    ref_out, ref_lse = _manual_combine_ref(
+        out_partial,
+        lse_partial,
+        split_valid_mask=split_valid_mask,
+    )
+    _assert_close("combine_dynamic_batched_out", out, ref_out, atol=0.0, rtol=0.0)
+    _assert_close("combine_dynamic_batched_lse", lse, ref_lse, atol=0.0, rtol=0.0)
+
+    out_partial = torch.randn(4, 7, 2, 8, device="cuda", dtype=torch.bfloat16)
+    lse_partial = torch.randn(4, 7, 2, device="cuda", dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32)
+    seqused = torch.tensor([3, 2], device="cuda", dtype=torch.int32)
+    dynamic_splits = torch.tensor([1, 3], device="cuda", dtype=torch.int32)
+    varlen_batch_idx = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        varlen_batch_idx=varlen_batch_idx,
+        num_splits_dynamic_ptr=dynamic_splits,
+        return_lse=True,
+    )
+    split_valid_mask = _manual_varlen_dynamic_split_mask(
+        num_splits=4,
+        total_q=7,
+        num_heads=2,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        num_splits_dynamic_ptr=dynamic_splits,
+        varlen_batch_idx=varlen_batch_idx,
+    )
+    ref_out, ref_lse = _manual_combine_ref(
+        out_partial,
+        lse_partial,
+        split_valid_mask=split_valid_mask,
+    )
+    _assert_close("combine_dynamic_varlen_out", out, ref_out, atol=0.0, rtol=0.0)
+    _assert_close("combine_dynamic_varlen_lse", lse, ref_lse, atol=0.0, rtol=0.0)
+
     def causal_block_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
         del batch_idx, head_idx, seqlen_info, aux_tensors
         return kv_idx <= q_idx
@@ -551,6 +661,51 @@ def main() -> int:
     _assert_close("block_sparse_fast_mask_idx", sparse_tensors.mask_block_idx, expected_mask_idx, atol=0.0, rtol=0.0)
     _assert_close("block_sparse_fast_full_cnt", sparse_tensors.full_block_cnt, expected_full_cnt, atol=0.0, rtol=0.0)
     _assert_close("block_sparse_fast_full_idx", sparse_tensors.full_block_idx, expected_full_idx, atol=0.0, rtol=0.0)
+
+    _manual_seed()
+    q = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+
+    def striped_block_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        del batch_idx, head_idx, seqlen_info, aux_tensors
+        return (kv_idx <= q_idx) & (((q_idx + kv_idx) % 3) != 1)
+
+    _, sparse_tensors = compute_block_sparsity(
+        128,
+        128,
+        1,
+        1,
+        256,
+        256,
+        striped_block_mask,
+        None,
+        torch.device("cuda"),
+        compute_full_blocks=True,
+    )
+    sparse_out, sparse_lse = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        mask_mod=striped_block_mask,
+        full_block_cnt=sparse_tensors.full_block_cnt,
+        full_block_idx=sparse_tensors.full_block_idx,
+        mask_block_cnt=sparse_tensors.mask_block_cnt,
+        mask_block_idx=sparse_tensors.mask_block_idx,
+        block_size=sparse_tensors.block_size,
+        return_lse=True,
+    )
+    ref_out, ref_lse = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        mask_mod=striped_block_mask,
+        return_lse=True,
+    )
+    _assert_close("block_sparse_forward_out", sparse_out, ref_out, atol=0.0, rtol=0.0)
+    _assert_close("block_sparse_forward_lse", sparse_lse, ref_lse, atol=0.0, rtol=0.0)
 
     q = torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)

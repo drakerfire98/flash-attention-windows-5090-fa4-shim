@@ -174,9 +174,6 @@ class NativeProbeForwardBridge(JitCompiledFunction):
         block_sparse_tensors: Any,
         aux_tensors: list[torch.Tensor] | None,
     ) -> None:
-        if block_sparse_tensors is not None:
-            raise NotImplementedError("Block-sparse native probe bridge is not implemented yet")
-
         shim = _load_windows_shim_module()
         common = dict(
             softmax_scale=softmax_scale,
@@ -193,7 +190,36 @@ class NativeProbeForwardBridge(JitCompiledFunction):
         if softcap is not None:
             score_mod = None
 
-        if is_varlen:
+        if block_sparse_tensors is not None:
+            if is_varlen:
+                raise NotImplementedError("Block-sparse native probe bridge does not yet support varlen sequences")
+            mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = block_sparse_tensors
+            q_subtile_factor = int(getattr(self.kernel, "q_subtile_factor", 1) or 1)
+            tile_m = int(getattr(self.kernel, "tile_m", getattr(self.kernel, "m_block_size", q.shape[1])))
+            tile_n = int(getattr(self.kernel, "tile_n", getattr(self.kernel, "n_block_size", k.shape[1])))
+            shim_out, shim_lse = shim._attention_forward_block_sparse(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=bool(getattr(self.kernel, "is_causal", False)),
+                window_size=_window_tuple(window_size_left, window_size_right),
+                learnable_sink=learnable_sink,
+                softcap=softcap or 0.0,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                full_block_cnt=full_block_cnt,
+                full_block_idx=full_block_idx,
+                mask_block_cnt=mask_block_cnt,
+                mask_block_idx=mask_block_idx,
+                block_size=(tile_m * q_subtile_factor, tile_n),
+                aux_tensors=aux_tensors,
+                batch_start_index=0,
+                offset_q=0,
+                offset_k=0,
+                return_lse=lse is not None,
+            )
+        elif is_varlen:
             shim_out, shim_lse = shim.flash_attn_varlen_func(
                 q,
                 k,
@@ -444,11 +470,6 @@ class NativeProbeForwardCombineBridge(JitCompiledFunction):
         semaphore_to_reset: torch.Tensor | None,
     ) -> None:
         del semaphore_to_reset
-        if num_splits_dynamic_ptr is not None:
-            raise NotImplementedError(
-                "Native probe forward-combine bridge does not yet implement num_splits_dynamic_ptr"
-            )
-
         shim = _load_windows_shim_module()
         shim_out, shim_lse = shim.flash_attn_combine(
             out_partial,
@@ -457,6 +478,7 @@ class NativeProbeForwardCombineBridge(JitCompiledFunction):
             cu_seqlens=cu_seqlens,
             seqused=seqused,
             varlen_batch_idx=varlen_batch_idx,
+            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
             return_lse=lse is not None,
         )
         _copy_tensor_like(out, shim_out)

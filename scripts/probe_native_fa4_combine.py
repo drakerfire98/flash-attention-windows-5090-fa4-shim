@@ -79,9 +79,73 @@ def _run_varlen(iface, shim_mod):
     _print_case_metrics("combine_varlen", native_out, ref_out, native_lse, ref_lse)
 
 
+def _run_dynamic_batched(iface, shim_mod):
+    torch.manual_seed(151)
+    out_partial = torch.randn(4, 2, 5, 3, 8, device="cuda", dtype=torch.bfloat16)
+    lse_partial = torch.randn(4, 2, 5, 3, device="cuda", dtype=torch.float32)
+    lse_partial[:, 1, 4, :] = float("-inf")
+    seqused = torch.tensor([3, 5], device="cuda", dtype=torch.int32)
+    dynamic_splits = torch.tensor([2, 4], device="cuda", dtype=torch.int32)
+    native_out = torch.empty(2, 5, 3, 8, device="cuda", dtype=torch.bfloat16)
+    native_lse = torch.empty(2, 5, 3, device="cuda", dtype=torch.float32)
+    iface._flash_attn_fwd_combine(
+        out_partial,
+        lse_partial,
+        native_out,
+        native_lse,
+        None,
+        seqused,
+        dynamic_splits,
+        None,
+        None,
+    )
+    ref_out, ref_lse = shim_mod.flash_attn_combine(
+        out_partial,
+        lse_partial,
+        seqused=seqused,
+        num_splits_dynamic_ptr=dynamic_splits,
+        return_lse=True,
+    )
+    _print_case_metrics("combine_dynamic_batched", native_out, ref_out, native_lse, ref_lse)
+
+
+def _run_dynamic_varlen(iface, shim_mod):
+    torch.manual_seed(173)
+    out_partial = torch.randn(4, 7, 2, 8, device="cuda", dtype=torch.bfloat16)
+    lse_partial = torch.randn(4, 7, 2, device="cuda", dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32)
+    seqused = torch.tensor([3, 2], device="cuda", dtype=torch.int32)
+    dynamic_splits = torch.tensor([1, 3], device="cuda", dtype=torch.int32)
+    varlen_batch_idx = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    native_out = torch.empty(7, 2, 8, device="cuda", dtype=torch.bfloat16)
+    native_lse = torch.empty(7, 2, device="cuda", dtype=torch.float32)
+    iface._flash_attn_fwd_combine(
+        out_partial,
+        lse_partial,
+        native_out,
+        native_lse,
+        cu_seqlens,
+        seqused,
+        dynamic_splits,
+        varlen_batch_idx,
+        None,
+    )
+    ref_out, ref_lse = shim_mod.flash_attn_combine(
+        out_partial,
+        lse_partial,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        varlen_batch_idx=varlen_batch_idx,
+        num_splits_dynamic_ptr=dynamic_splits,
+        return_lse=True,
+    )
+    _print_case_metrics("combine_dynamic_varlen", native_out, ref_out, native_lse, ref_lse)
+
+
 def main() -> int:
     repo_root = _repo_root()
     sys.path.insert(0, str(repo_root / "native_probe_shims"))
+    sys.path.insert(0, str(repo_root / "cutlass_runtime" / "src"))
 
     import flash_attn.cute.interface as iface
     import cutlass
@@ -96,6 +160,8 @@ def main() -> int:
     for runner in (
         lambda: _run_batched(iface, shim_mod),
         lambda: _run_varlen(iface, shim_mod),
+        lambda: _run_dynamic_batched(iface, shim_mod),
+        lambda: _run_dynamic_varlen(iface, shim_mod),
     ):
         _clear_compile_cache(iface)
         runner()

@@ -157,6 +157,82 @@ def _run_dense_mask_mod(native_flash_attn_func, shim_mod):
     _print_case_metrics("dense_mask_mod", native_out, ref_out, native_lse, ref_lse)
 
 
+def _run_dense_block_sparse(iface, shim_mod):
+    torch.manual_seed(41)
+    q = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
+
+    def striped_block_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        del batch_idx, head_idx, seqlen_info, aux_tensors
+        return (kv_idx <= q_idx) & (((q_idx + kv_idx) % 3) != 1)
+
+    _, sparse_tensors = shim_mod.compute_block_sparsity(
+        256,
+        128,
+        1,
+        1,
+        256,
+        256,
+        striped_block_mask,
+        None,
+        torch.device("cuda"),
+        compute_full_blocks=True,
+    )
+    from types import SimpleNamespace
+    from cutlass.cute._compile_bridge import NativeProbeForwardBridge
+
+    bridge = NativeProbeForwardBridge(
+        SimpleNamespace(
+            is_causal=False,
+            score_mod=None,
+            mask_mod=striped_block_mask,
+            tile_m=128,
+            tile_n=128,
+            q_subtile_factor=2,
+        )
+    )
+    native_out = torch.empty_like(q)
+    native_lse = torch.empty((q.shape[0], q.shape[2], q.shape[1]), device="cuda", dtype=torch.float32)
+    bridge(
+        q,
+        k,
+        v,
+        native_out,
+        native_lse,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        (
+            sparse_tensors.mask_block_cnt,
+            sparse_tensors.mask_block_idx,
+            sparse_tensors.full_block_cnt,
+            sparse_tensors.full_block_idx,
+        ),
+        None,
+    )
+    ref_out, ref_lse = shim_mod.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        mask_mod=striped_block_mask,
+        full_block_cnt=sparse_tensors.full_block_cnt,
+        full_block_idx=sparse_tensors.full_block_idx,
+        mask_block_cnt=sparse_tensors.mask_block_cnt,
+        mask_block_idx=sparse_tensors.mask_block_idx,
+        block_size=sparse_tensors.block_size,
+        return_lse=True,
+    )
+    _print_case_metrics("dense_block_sparse", native_out, ref_out, native_lse, ref_lse)
+
+
 def _run_varlen_softcap(native_flash_attn_varlen_func, shim_mod):
     torch.manual_seed(19)
     q = torch.randn(9, 2, 32, device="cuda", dtype=torch.bfloat16)
@@ -267,6 +343,7 @@ def _run_varlen_seqused_score_mod(native_flash_attn_varlen_func, shim_mod):
 def main() -> int:
     repo_root = _repo_root()
     sys.path.insert(0, str(repo_root / "native_probe_shims"))
+    sys.path.insert(0, str(repo_root / "cutlass_runtime" / "src"))
 
     from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
     import flash_attn.cute.interface as iface
@@ -284,6 +361,7 @@ def main() -> int:
         lambda: _run_dense_softcap(flash_attn_func, shim_mod),
         lambda: _run_dense_learnable_sink(flash_attn_func, shim_mod),
         lambda: _run_dense_mask_mod(flash_attn_func, shim_mod),
+        lambda: _run_dense_block_sparse(iface, shim_mod),
         lambda: _run_varlen_softcap(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_score_mod(flash_attn_varlen_func, shim_mod),

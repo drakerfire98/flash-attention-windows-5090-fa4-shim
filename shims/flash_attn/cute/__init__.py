@@ -447,6 +447,7 @@ def _attention_forward_dense(
     batch_start_index: int,
     offset_q: int,
     offset_k: int,
+    extra_keep_mask: Optional[torch.Tensor],
     return_lse: bool,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -469,7 +470,14 @@ def _attention_forward_dense(
             device=q.device,
         )
 
-    if softcap == 0.0 and not return_lse and sink is None and score_mod is None and mask_mod is None:
+    if (
+        softcap == 0.0
+        and not return_lse
+        and sink is None
+        and score_mod is None
+        and mask_mod is None
+        and extra_keep_mask is None
+    ):
         if causal and _normalize_window_size(window_size) == (None, None):
             use_native_causal = True
             attn_mask_for_sdpa = None
@@ -502,6 +510,8 @@ def _attention_forward_dense(
         scores = torch.tanh(scores / softcap) * softcap
     if attn_mask is not None:
         scores = scores.masked_fill(~attn_mask.view(1, 1, q.shape[1], k.shape[1]), float("-inf"))
+    if extra_keep_mask is not None:
+        scores = scores.masked_fill(~extra_keep_mask, float("-inf"))
     if mask_mod is not None:
         keep_mask = _apply_mask_mod(
             scores,
@@ -533,6 +543,190 @@ def _attention_forward_dense(
     return out.permute(0, 2, 1, 3).contiguous(), lse
 
 
+def _normalize_block_sparse_pair(
+    name: str,
+    cnt: Optional[torch.Tensor],
+    idx: Optional[torch.Tensor],
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if (cnt is None) != (idx is None):
+        raise ValueError(f"{name}_block_cnt and {name}_block_idx must both be provided or both be omitted")
+    if cnt is None or idx is None:
+        return None, None
+    if cnt.ndim != 3 or idx.ndim != 4:
+        raise ValueError(f"{name}_block tensors must have shapes (B, H, M) and (B, H, M, N)")
+    if cnt.dtype != torch.int32 or idx.dtype != torch.int32:
+        raise ValueError(f"{name}_block tensors must use dtype torch.int32")
+    if cnt.device != idx.device:
+        raise ValueError(f"{name}_block tensors must live on the same device")
+    if cnt.shape[:3] != idx.shape[:3]:
+        raise ValueError(f"{name}_block_cnt and {name}_block_idx must share batch/head/m-block dimensions")
+    return cnt, idx
+
+
+def _resolve_block_sparse_block_size(
+    *,
+    block_size: Optional[Tuple[int, int]],
+    seqlen_q: int,
+    seqlen_k: int,
+    mask_block_idx: Optional[torch.Tensor],
+    full_block_idx: Optional[torch.Tensor],
+) -> tuple[int, int]:
+    if block_size is not None:
+        block_q, block_k = block_size
+        if block_q <= 0 or block_k <= 0:
+            raise ValueError("block_size entries must be positive")
+        return int(block_q), int(block_k)
+
+    index_tensor = mask_block_idx if mask_block_idx is not None else full_block_idx
+    if index_tensor is None:
+        raise ValueError("block-sparse inputs require at least one block index tensor")
+    num_m_blocks = int(index_tensor.shape[2])
+    num_n_blocks = int(index_tensor.shape[3])
+    if num_m_blocks <= 0 or num_n_blocks <= 0:
+        raise ValueError("block-sparse tensors must include at least one block in each dimension")
+    return (
+        max(1, (int(seqlen_q) + num_m_blocks - 1) // num_m_blocks),
+        max(1, (int(seqlen_k) + num_n_blocks - 1) // num_n_blocks),
+    )
+
+
+def _build_block_sparse_keep_mask(
+    *,
+    batch_size: int,
+    num_heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    mask_block_cnt: Optional[torch.Tensor],
+    mask_block_idx: Optional[torch.Tensor],
+    full_block_cnt: Optional[torch.Tensor],
+    full_block_idx: Optional[torch.Tensor],
+    block_size: Optional[Tuple[int, int]],
+    device: torch.device,
+) -> torch.Tensor:
+    mask_block_cnt, mask_block_idx = _normalize_block_sparse_pair(
+        "mask",
+        mask_block_cnt,
+        mask_block_idx,
+    )
+    full_block_cnt, full_block_idx = _normalize_block_sparse_pair(
+        "full",
+        full_block_cnt,
+        full_block_idx,
+    )
+    if mask_block_idx is None and full_block_idx is None:
+        raise ValueError("block-sparse inputs require at least one of mask/full block tensors")
+
+    if mask_block_idx is None:
+        assert full_block_cnt is not None and full_block_idx is not None
+        mask_block_cnt = torch.zeros_like(full_block_cnt)
+        mask_block_idx = torch.zeros_like(full_block_idx)
+
+    assert mask_block_cnt is not None and mask_block_idx is not None
+    block_q, block_k = _resolve_block_sparse_block_size(
+        block_size=block_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        mask_block_idx=mask_block_idx,
+        full_block_idx=full_block_idx,
+    )
+
+    if mask_block_cnt.shape[0] not in (1, batch_size) or mask_block_cnt.shape[1] not in (1, num_heads):
+        raise ValueError("mask block tensors must use batch/head dims of either 1 or match q")
+    if full_block_cnt is not None and (
+        full_block_cnt.shape[0] not in (1, batch_size) or full_block_cnt.shape[1] not in (1, num_heads)
+    ):
+        raise ValueError("full block tensors must use batch/head dims of either 1 or match q")
+
+    keep_mask = torch.zeros((batch_size, num_heads, seqlen_q, seqlen_k), device=device, dtype=torch.bool)
+    num_sparse_m_blocks = mask_block_cnt.shape[2]
+
+    for batch_idx in range(batch_size):
+        batch_sel = 0 if mask_block_cnt.shape[0] == 1 else batch_idx
+        full_batch_sel = 0 if full_block_cnt is None or full_block_cnt.shape[0] == 1 else batch_idx
+        for head_idx in range(num_heads):
+            head_sel = 0 if mask_block_cnt.shape[1] == 1 else head_idx
+            full_head_sel = 0 if full_block_cnt is None or full_block_cnt.shape[1] == 1 else head_idx
+            for sparse_m_block in range(num_sparse_m_blocks):
+                q_start = sparse_m_block * block_q
+                q_end = min(q_start + block_q, seqlen_q)
+                if q_start >= q_end:
+                    continue
+
+                mask_count = int(mask_block_cnt[batch_sel, head_sel, sparse_m_block].item())
+                for offset in range(mask_count):
+                    n_block = int(mask_block_idx[batch_sel, head_sel, sparse_m_block, offset].item())
+                    k_start = n_block * block_k
+                    k_end = min(k_start + block_k, seqlen_k)
+                    if k_start < k_end:
+                        keep_mask[batch_idx, head_idx, q_start:q_end, k_start:k_end] = True
+
+                if full_block_cnt is not None and full_block_idx is not None:
+                    full_count = int(full_block_cnt[full_batch_sel, full_head_sel, sparse_m_block].item())
+                    for offset in range(full_count):
+                        n_block = int(full_block_idx[full_batch_sel, full_head_sel, sparse_m_block, offset].item())
+                        k_start = n_block * block_k
+                        k_end = min(k_start + block_k, seqlen_k)
+                        if k_start < k_end:
+                            keep_mask[batch_idx, head_idx, q_start:q_end, k_start:k_end] = True
+
+    return keep_mask
+
+
+def _attention_forward_block_sparse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: Optional[float],
+    causal: bool,
+    window_size: Tuple[Optional[int], Optional[int]],
+    learnable_sink: Optional[torch.Tensor],
+    softcap: float,
+    score_mod: Optional[Callable],
+    mask_mod: Optional[Callable],
+    full_block_cnt: Optional[torch.Tensor],
+    full_block_idx: Optional[torch.Tensor],
+    mask_block_cnt: Optional[torch.Tensor],
+    mask_block_idx: Optional[torch.Tensor],
+    block_size: Optional[Tuple[int, int]],
+    aux_tensors: Optional[list],
+    batch_start_index: int,
+    offset_q: int,
+    offset_k: int,
+    return_lse: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    keep_mask = _build_block_sparse_keep_mask(
+        batch_size=int(q.shape[0]),
+        num_heads=int(q.shape[2]),
+        seqlen_q=int(q.shape[1]),
+        seqlen_k=int(k.shape[1]),
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=block_size,
+        device=q.device,
+    )
+    return _attention_forward_dense(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        batch_start_index=batch_start_index,
+        offset_q=offset_q,
+        offset_k=offset_k,
+        extra_keep_mask=keep_mask,
+        return_lse=return_lse,
+    )
+
+
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -553,13 +747,34 @@ def flash_attn_func(
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
 ):
-    del deterministic, num_splits, pack_gqa, block_size
+    del deterministic, num_splits, pack_gqa
+    _check_supported_common(learnable_sink=learnable_sink, mask_mod=mask_mod, softcap=softcap)
     if any(
         tensor is not None
         for tensor in (full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx)
     ):
-        raise NotImplementedError("block-sparse inputs are not supported by the Windows shim")
-    _check_supported_common(learnable_sink=learnable_sink, mask_mod=mask_mod, softcap=softcap)
+        return _attention_forward_block_sparse(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            score_mod=None,
+            mask_mod=mask_mod,
+            full_block_cnt=full_block_cnt,
+            full_block_idx=full_block_idx,
+            mask_block_cnt=mask_block_cnt,
+            mask_block_idx=mask_block_idx,
+            block_size=block_size,
+            aux_tensors=None,
+            batch_start_index=0,
+            offset_q=0,
+            offset_k=0,
+            return_lse=return_lse,
+        )
     return _attention_forward_dense(
         q,
         k,
@@ -575,6 +790,7 @@ def flash_attn_func(
         batch_start_index=0,
         offset_q=0,
         offset_k=0,
+        extra_keep_mask=None,
         return_lse=return_lse,
     )
 
@@ -648,6 +864,7 @@ def flash_attn_varlen_func(
                 batch_start_index=batch_idx,
                 offset_q=q_layout.logical_starts[batch_idx],
                 offset_k=k_layout.logical_starts[batch_idx],
+                extra_keep_mask=None,
                 return_lse=return_lse,
             )
 
@@ -694,6 +911,8 @@ def flash_attn_varlen_func(
 def _combine_split_attention(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
+    *,
+    split_valid_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if out_partial.ndim not in (4, 5):
         raise ValueError("out_partial must have 4 or 5 dimensions")
@@ -706,6 +925,10 @@ def _combine_split_attention(
 
     lse_float = lse_partial.float()
     valid = ~torch.isneginf(lse_float)
+    if split_valid_mask is not None:
+        if split_valid_mask.shape != lse_partial.shape:
+            raise ValueError("split_valid_mask must match lse_partial shape")
+        valid = valid & split_valid_mask
     any_valid = valid.any(dim=0)
     lse_max = torch.amax(lse_float, dim=0)
     safe_lse_max = torch.where(any_valid, lse_max, torch.zeros_like(lse_max))
@@ -728,6 +951,103 @@ def _combine_split_attention(
         torch.full_like(safe_lse_max, float("-inf")),
     )
     return out, lse
+
+
+def _resolve_real_batch_index(
+    *,
+    batch_size: int,
+    reference: torch.Tensor,
+    varlen_batch_idx: Optional[torch.Tensor],
+    name: str,
+) -> torch.Tensor:
+    if varlen_batch_idx is None:
+        return torch.arange(batch_size, device=reference.device, dtype=torch.long)
+    if varlen_batch_idx.ndim != 1 or varlen_batch_idx.numel() != batch_size:
+        raise ValueError(f"{name} must be 1D with one entry per batch item")
+    return varlen_batch_idx.to(device=reference.device, dtype=torch.long)
+
+
+def _build_combine_split_valid_mask(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    *,
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    num_splits_dynamic_ptr: Optional[torch.Tensor],
+    varlen_batch_idx: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    needs_mask = any(t is not None for t in (cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx))
+    if not needs_mask:
+        return None
+
+    num_splits = int(out_partial.shape[0])
+    device = out_partial.device
+    split_ids = torch.arange(num_splits, device=device, dtype=torch.long)
+
+    if out_partial.ndim == 5:
+        _, batch_size, seqlen_q, num_heads = lse_partial.shape
+        real_batch_idx = _resolve_real_batch_index(
+            batch_size=batch_size,
+            reference=out_partial,
+            varlen_batch_idx=varlen_batch_idx,
+            name="varlen_batch_idx",
+        )
+        seq_valid = torch.ones((batch_size, seqlen_q), device=device, dtype=torch.bool)
+        if seqused is not None:
+            used = seqused.to(device=device, dtype=torch.long)[real_batch_idx]
+            q_ids = torch.arange(seqlen_q, device=device, dtype=torch.long).view(1, seqlen_q)
+            seq_valid = q_ids < used.view(batch_size, 1)
+        split_valid = torch.ones((num_splits, batch_size), device=device, dtype=torch.bool)
+        if num_splits_dynamic_ptr is not None:
+            split_counts = num_splits_dynamic_ptr.to(device=device, dtype=torch.long)[real_batch_idx].clamp(0, num_splits)
+            split_valid = split_ids.view(num_splits, 1) < split_counts.view(1, batch_size)
+        mask = split_valid.view(num_splits, batch_size, 1, 1) & seq_valid.view(1, batch_size, seqlen_q, 1)
+        return mask.expand(num_splits, batch_size, seqlen_q, num_heads)
+
+    if out_partial.ndim != 4:
+        raise ValueError("out_partial must have 4 or 5 dimensions")
+
+    _, total_q, num_heads = lse_partial.shape
+    token_batch_idx = torch.zeros((total_q,), device=device, dtype=torch.long)
+    token_valid = torch.ones((total_q,), device=device, dtype=torch.bool)
+    if cu_seqlens is not None:
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 1:
+            raise ValueError("cu_seqlens must be 1D with at least one element")
+        batch_size = int(cu_seqlens.numel() - 1)
+        real_batch_idx = _resolve_real_batch_index(
+            batch_size=batch_size,
+            reference=out_partial,
+            varlen_batch_idx=varlen_batch_idx,
+            name="varlen_batch_idx",
+        )
+        token_batch_idx = torch.zeros((total_q,), device=device, dtype=torch.long)
+        token_valid = torch.zeros((total_q,), device=device, dtype=torch.bool)
+        for batch_idx in range(batch_size):
+            start = int(cu_seqlens[batch_idx].item())
+            end = int(cu_seqlens[batch_idx + 1].item())
+            used = end - start
+            real_idx = int(real_batch_idx[batch_idx].item())
+            if seqused is not None:
+                used = min(used, max(0, int(seqused[real_idx].item())))
+            valid_end = min(start + used, end, total_q)
+            if valid_end > start:
+                token_batch_idx[start:valid_end] = real_idx
+                token_valid[start:valid_end] = True
+    elif seqused is not None and seqused.numel() == 1:
+        used = min(total_q, max(0, int(seqused[0].item())))
+        token_valid = torch.arange(total_q, device=device, dtype=torch.long) < used
+
+    split_valid = token_valid.view(1, total_q, 1).expand(num_splits, total_q, num_heads)
+    if num_splits_dynamic_ptr is not None:
+        split_counts = torch.zeros((total_q,), device=device, dtype=torch.long)
+        if token_valid.any():
+            split_counts[token_valid] = num_splits_dynamic_ptr.to(device=device, dtype=torch.long)[
+                token_batch_idx[token_valid]
+            ].clamp(0, num_splits)
+        split_valid = split_valid & (
+            split_ids.view(num_splits, 1, 1) < split_counts.view(1, total_q, 1)
+        )
+    return split_valid
 
 
 def _coerce_python_int(value: int | torch.Tensor) -> int:
@@ -932,11 +1252,22 @@ def flash_attn_combine(
     cu_seqlens: Optional[torch.Tensor] = None,
     seqused: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
+    num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     return_lse: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    del cu_seqlens, seqused, varlen_batch_idx
-
-    combined_out, combined_lse = _combine_split_attention(out_partial, lse_partial)
+    split_valid_mask = _build_combine_split_valid_mask(
+        out_partial,
+        lse_partial,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        num_splits_dynamic_ptr=num_splits_dynamic_ptr,
+        varlen_batch_idx=varlen_batch_idx,
+    )
+    combined_out, combined_lse = _combine_split_attention(
+        out_partial,
+        lse_partial,
+        split_valid_mask=split_valid_mask,
+    )
     if out is None:
         target_dtype = out_dtype if out_dtype is not None else out_partial.dtype
         out = combined_out.to(dtype=target_dtype)

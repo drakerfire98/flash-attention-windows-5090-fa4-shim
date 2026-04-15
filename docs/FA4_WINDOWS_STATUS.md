@@ -90,13 +90,23 @@ raw import-shape fix and the installable top-level `cutlass` wrapper.
 
 1. The runtime still depends on the legacy editable CUTLASS tree plus our shim-provided `cutlass.cute` surface.
 
-The runtime probe still reports:
+The runtime probe previously reported:
 
 ```text
 cutlass_probe_mode=legacy-editable-cutlass
 ```
 
-That means the environment is still bootstrapping from:
+The probe path now imports `cutlass` through the installable wrapper first and currently reports:
+
+```text
+cutlass_probe_mode=runtime-wrapper+legacy-core
+```
+
+That means the environment is now entering through:
+
+- `cutlass_runtime/src/cutlass/__init__.py`
+
+but it is still ultimately delegating down to:
 
 - `third_party/flash-attention-for-windows/csrc/cutlass/python/cutlass`
 
@@ -167,6 +177,8 @@ Dense-path verification is now stable:
 
 Additional validation coverage now passes in `scripts/validate_fa4_windows_shim.py`:
 
+- dynamic split-aware forward-combine masking for both batched and varlen layouts
+- block-sparse forward parity against the dense mask-mod reference path
 - local window attention
 - dense `softcap`, including backward parity
 - dense `mask_mod`, including fully masked-row stability
@@ -238,7 +250,9 @@ Current probe result:
 - recognized FA4 forward-kernel `cute.compile(...)` calls now return a real `NativeProbeForwardBridge` object instead of a dead placeholder
 - that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
 - recognized FA4 forward-combine `cute.compile(...)` calls now also return a real `NativeProbeForwardCombineBridge`
+- that forward-combine bridge now also handles `num_splits_dynamic_ptr`, with exact parity in both the batched and varlen dynamic-split probe cases
 - recognized FA4 `compute_block_sparsity(...)` `cute.compile(...)` calls now also return a real `NativeProbeBlockSparsityBridge`
+- the forward bridge now also supports end-to-end block-sparse execution onto the stable Windows shim path, with exact parity in the direct bridge probe case
 - recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
 - `scripts/probe_native_fa4_backward.py` still reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs after the compat package is installed
 - the backward bridge now also preserves forward-only feature metadata across the preprocess step so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim
@@ -259,8 +273,8 @@ Observed probe output with `return_lse=True`:
 - LSE type: `Tensor`
 - compiled kernel cache entry type: `NativeProbeForwardBridge`
 - compiled kernel cache entry repr: `<NativeProbeForwardBridge FlashAttentionForwardSm120>`
-- CUTLASS probe mode: `legacy-editable-cutlass`
-- CUTLASS probe reason: `nvidia-cutlass-dsl` is installed, but no separate modern importable CUTLASS package files are available on this Windows env
+- CUTLASS probe mode: `runtime-wrapper+legacy-core`
+- CUTLASS probe reason: the repo's installable `cutlass_runtime/` wrapper is now the import entrypoint, but it still delegates to the legacy editable CUTLASS tree because no standalone modern CUTLASS package is importable on this Windows env
 
 Observed backward probe output:
 
@@ -302,6 +316,10 @@ Observed forward-combine probe output:
 - batched combine LSE max diff vs stable shim: `0.0`
 - varlen combine output max diff vs stable shim: `0.0`
 - varlen combine LSE max diff vs stable shim: `0.0`
+- dynamic batched combine output max diff vs stable shim: `0.0`
+- dynamic batched combine LSE max diff vs stable shim: `0.0`
+- dynamic varlen combine output max diff vs stable shim: `0.0`
+- dynamic varlen combine LSE max diff vs stable shim: `0.0`
 - `_flash_attn_fwd_combine.compile_cache` now holds `NativeProbeForwardCombineBridge`
 
 Observed block-sparsity probe output:
@@ -309,6 +327,12 @@ Observed block-sparsity probe output:
 - exact block-sparsity mask/full count and index tensors match the stable Windows shim exactly
 - fast-sampling block-sparsity mask/full count and index tensors also match the stable Windows shim exactly
 - `compute_block_sparsity.compile_cache` now holds `NativeProbeBlockSparsityBridge`
+
+Observed direct block-sparse forward bridge output:
+
+- dense block-sparse output max diff vs stable shim: `0.0`
+- dense block-sparse LSE max diff vs stable shim: `0.0`
+- this currently exercises `NativeProbeForwardBridge` directly because the upstream public SM120 wrapper still raises its own block-sparsity guard before the bridge can take over
 
 Observed cubin loader probe output:
 
@@ -352,8 +376,9 @@ At the moment this repo contains:
   - raw CUDA / `nvidia_cutlass_dsl` import mismatch, now fixed by `runtime_compat/`
   - missing top-level `cutlass.cute`, now fixed by `cutlass_runtime/`
   - direct cubin loading, now fixed by the runtime-library shim path
-  - upstream forward-combine and block-sparsity compile families, now covered by probe bridges
-  - the remaining honest blocker: no true end-to-end Windows CuTe DSL compiler/runtime behind that import surface
+- upstream forward-combine and block-sparsity compile families, now covered by probe bridges
+- direct bridge validation now also covers block-sparse forward execution and dynamic split-aware combine execution
+- the remaining honest blocker: no true end-to-end Windows CuTe DSL compiler/runtime behind that import surface
 - a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, and the mixed packed/padded varlen layouts
 
 It does **not** yet contain a verified native Windows FA4 runtime path.

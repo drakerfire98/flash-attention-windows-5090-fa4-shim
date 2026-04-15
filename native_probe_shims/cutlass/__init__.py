@@ -32,11 +32,13 @@ _IMPORT_ORIGIN = Path(getattr(globals().get("__spec__"), "origin", __file__)).re
 _REPO_ROOT = _SHIM_DIR.parents[1]
 _WORKSPACE_ROOT = _REPO_ROOT.parent
 _CUTLASS_RUNTIME_WRAPPER_ROOT = _REPO_ROOT / "cutlass_runtime"
+_CUTLASS_RUNTIME_WRAPPER_INIT = _CUTLASS_RUNTIME_WRAPPER_ROOT / "src" / "cutlass" / "__init__.py"
 _LEGACY_PYTHON_ROOT = (
     _WORKSPACE_ROOT / "third_party" / "flash-attention-for-windows" / "csrc" / "cutlass" / "python"
 )
 _LEGACY_PACKAGE_DIR = _LEGACY_PYTHON_ROOT / "cutlass"
 _LEGACY_INIT = _LEGACY_PACKAGE_DIR / "__init__.py"
+_IMPORTED_VIA_RUNTIME_WRAPPER = _IMPORT_ORIGIN == _CUTLASS_RUNTIME_WRAPPER_INIT
 
 _MODERN_CANDIDATES = find_package_init_candidates(
     "cutlass",
@@ -58,7 +60,9 @@ else:
     _REAL_INIT = _LEGACY_INIT
     _REAL_PACKAGE_DIR = _LEGACY_PACKAGE_DIR
     _REAL_PYTHON_ROOT = _LEGACY_PYTHON_ROOT
-    _PACKAGE_MODE = "legacy-editable-cutlass"
+    _PACKAGE_MODE = (
+        "runtime-wrapper+legacy-core" if _IMPORTED_VIA_RUNTIME_WRAPPER else "legacy-editable-cutlass"
+    )
 
 if str(_REAL_PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(_REAL_PYTHON_ROOT))
@@ -81,7 +85,7 @@ def _ensure_probe_cuda_shim_loaded() -> None:
     spec.loader.exec_module(module)
 
 
-if _PACKAGE_MODE == "legacy-editable-cutlass":
+if _PACKAGE_MODE in {"legacy-editable-cutlass", "runtime-wrapper+legacy-core"}:
     _ensure_probe_cuda_shim_loaded()
 
 __path__ = (
@@ -101,6 +105,12 @@ if _PACKAGE_MODE == "modern-cutlass-package":
     NATIVE_PROBE_REASON = (
         "Using a real non-legacy CUTLASS package discovered on sys.path; shim "
         "modules stay available only as fallback."
+    )
+elif _PACKAGE_MODE == "runtime-wrapper+legacy-core":
+    NATIVE_PROBE_REASON = (
+        "Imported through the repo's installable cutlass_runtime wrapper, but no "
+        "standalone modern CUTLASS package is importable in this env yet. Using "
+        "the wrapper plus the legacy editable CUTLASS tree and probe shims."
     )
 elif NATIVE_PROBE_DIST_VERSIONS["nvidia-cutlass-dsl"] is not None:
     NATIVE_PROBE_REASON = (

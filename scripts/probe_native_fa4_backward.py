@@ -298,6 +298,7 @@ def _run_varlen_seqused_score_mod(native_flash_attn_varlen_func, shim_mod):
 def main() -> int:
     repo_root = _repo_root()
     sys.path.insert(0, str(repo_root / "native_probe_shims"))
+    sys.path.insert(0, str(repo_root / "cutlass_runtime" / "src"))
 
     from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
     import flash_attn.cute.interface as iface

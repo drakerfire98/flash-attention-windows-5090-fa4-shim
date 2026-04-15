@@ -123,6 +123,7 @@ def _run_fast_sampling(module, shim_mod):
 def main() -> int:
     repo_root = _repo_root()
     sys.path.insert(0, str(repo_root / "native_probe_shims"))
+    sys.path.insert(0, str(repo_root / "cutlass_runtime" / "src"))
 
     import cutlass
     import flash_attn.cute.compute_block_sparsity as block_sparse_module
