@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fa4-windows-cutlass-runtime"
+version = "0.1.0"
+description = "Installable Windows cutlass probe runtime for FlashAttention 4"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "drakerfire98"},
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["cutlass"]
+py-modules = ["_probe_helpers", "fcntl"]

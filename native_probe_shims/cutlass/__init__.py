@@ -27,7 +27,10 @@ from _probe_helpers import (
 
 
 _SHIM_DIR = Path(__file__).resolve().parent
-_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+_IMPORT_ORIGIN = Path(getattr(globals().get("__spec__"), "origin", __file__)).resolve()
+_REPO_ROOT = _SHIM_DIR.parents[1]
+_WORKSPACE_ROOT = _REPO_ROOT.parent
+_CUTLASS_RUNTIME_WRAPPER_ROOT = _REPO_ROOT / "cutlass_runtime"
 _LEGACY_PYTHON_ROOT = (
     _WORKSPACE_ROOT / "third_party" / "flash-attention-for-windows" / "csrc" / "cutlass" / "python"
 )
@@ -38,6 +41,8 @@ _MODERN_CANDIDATES = find_package_init_candidates(
     "cutlass",
     exclude_roots=[
         _SHIM_DIR,
+        _IMPORT_ORIGIN.parent,
+        _CUTLASS_RUNTIME_WRAPPER_ROOT,
         _LEGACY_PYTHON_ROOT,
     ],
 )
@@ -62,7 +67,7 @@ def _ensure_probe_cuda_shim_loaded() -> None:
     cuda_mod = sys.modules.get("cuda")
     if cuda_mod is not None and hasattr(cuda_mod, "__version__"):
         return
-    cuda_init = _WORKSPACE_ROOT / "flash-attention-windows-5090" / "native_probe_shims" / "cuda" / "__init__.py"
+    cuda_init = _REPO_ROOT / "native_probe_shims" / "cuda" / "__init__.py"
     spec = importlib.util.spec_from_file_location(
         "cuda",
         cuda_init,

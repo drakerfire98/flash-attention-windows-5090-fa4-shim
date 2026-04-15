@@ -31,6 +31,7 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/probe_native_fa4_forward.py`: native-path forward probe covering base dense attention, dense `softcap`, dense `mask_mod`, and varlen `softcap`
 - `scripts/probe_native_fa4_backward.py`: dense + varlen native-path backward parity probe against the stable Windows shim
 - `runtime_compat/`: installable Windows import-compat package that restores the old top-level `cuda` API shape and provides a discoverable `nvidia_cutlass_dsl` module name
+- `cutlass_runtime/`: installable top-level `cutlass` wrapper that promotes the repo's native probe package into a normal Windows import surface
 - `shims/`: repo-local compatibility shims used only for FA4 Windows probing
 - `native_probe_shims/`: isolated import/runtime scaffolding that pushes the native FA4 path farther without touching the stable fallback
 - `patches/*.patch`: reference diffs for the required source edits
@@ -48,7 +49,7 @@ FlashAttention 4 was tested in a dedicated `.venv_fa4` environment on the same m
 Current status:
 
 - `flash-attn-4` can be installed as an editable package from the local `flash_attn/cute` tree
-- the native Windows import path still does not work without extra shims
+- after installing `runtime_compat/` and `cutlass_runtime/`, a clean top-level `import flash_attn.cute` now works without manually prepending `native_probe_shims` to `sys.path`
 - a repo-local shim package under `shims/` now shadows `flash_attn.cute` in `.venv_fa4`
 - the shimmed dense `flash_attn_func` forward and backward probes both match torch SDPA exactly in the isolated test
 - the shimmed varlen path was also cross-checked against FA2 behavior for unequal sequence lengths and matched closely
@@ -77,14 +78,15 @@ Current status:
   - varlen `score_mod` forward parity is exact against the stable Windows shim
   - varlen `seqused_q` / `seqused_k` plus `score_mod` backward parity is exact against the stable Windows shim
 - the compiled cache entry for that path is now `NativeProbeForwardBridge`, not a dead placeholder
-- the CUTLASS runtime probe now explicitly shows that raw `cutlass` still resolves to the legacy editable tree, raw `cutlass` import still fails before shims on the old `cuda` surface, and no importable `nvidia_cutlass_dsl` package is present on this Windows env, so the probe still falls back to the legacy editable CUTLASS tree plus compatibility shims
+- the CUTLASS runtime probe now shows that raw `cutlass`, raw `cuda`, and raw `nvidia_cutlass_dsl` imports all succeed from repo-local Windows wrapper packages
 - a small installable compat package now exists under `runtime_compat/`; once installed into `.venv_fa4`, the raw Windows import surface improves to:
   - `raw_cutlass_import=ok`
   - `raw_cuda_import=ok` from `runtime_compat/src/cuda/__init__.py`
   - `raw_nvidia_cutlass_dsl_import=ok` from `runtime_compat/src/nvidia_cutlass_dsl/__init__.py`
-  - the remaining blockers shrink to the deeper native-runtime issues: raw `cutlass` still resolves to the legacy editable tree, and the native probe still requires the legacy tree plus shims
+  - then, after also installing `cutlass_runtime/`, `raw_cutlass_spec` resolves to `cutlass_runtime/src/cutlass/__init__.py` and clean `import flash_attn.cute` succeeds without manual probe-path injection
+  - the remaining blocker then shrinks to the true runtime gap: the native probe still requires the legacy editable CUTLASS tree plus our shim-provided `cutlass.cute` surface
 
-The root native blocker is now pinned down more precisely than just "missing wheels". In `.venv_fa4`, the editable CUTLASS Python tree is present, but the newer FA4 stack expects a much larger CUTLASS DSL surface than that tree provides. The isolated `native_probe_shims/` layer now bridges enough of the CUDA API shape, CUTLASS package shape, CuTe module tree, MLIR dialects, pipeline classes, and Unix-only `fcntl` import to make the real `flash_attn.cute` import succeed. It also now intercepts recognized FA4 forward-kernel `cute.compile(...)` calls and returns a real `NativeProbeForwardBridge` object that routes execution onto the validated Windows shim path, producing numerically sane dense outputs and LSE tensors with close parity versus SDPA in the probe. On backward, the bridge now also carries forward feature metadata across the preprocess step so SM120 gaps like `softcap`, `mask_mod`, `learnable_sink`, and varlen `score_mod` can fall back compatibly onto the stable Windows shim. The new `runtime_compat/` package also fixes the raw Windows import mismatch directly by restoring the old `cuda` API shape and an importable `nvidia_cutlass_dsl` module name inside `.venv_fa4`. The runtime probe now shows the remaining native blockers more honestly: `cutlass` still resolves to the legacy editable tree and the native probe still needs that legacy tree plus shims, so the current stable path is still the Windows compatibility shim and selective bridge objects rather than a true native FA4 kernel path.
+The root native blocker is now pinned down more precisely than just "missing wheels". In `.venv_fa4`, the editable CUTLASS Python tree is present, but the newer FA4 stack expects a much larger CUTLASS DSL surface than that tree provides. The isolated `native_probe_shims/` layer now bridges enough of the CUDA API shape, CUTLASS package shape, CuTe module tree, MLIR dialects, pipeline classes, and Unix-only `fcntl` import to make the real `flash_attn.cute` import succeed. It also now intercepts recognized FA4 forward-kernel `cute.compile(...)` calls and returns a real `NativeProbeForwardBridge` object that routes execution onto the validated Windows shim path, producing numerically sane dense outputs and LSE tensors with close parity versus SDPA in the probe. On backward, the bridge now also carries forward feature metadata across the preprocess step so SM120 gaps like `softcap`, `mask_mod`, `learnable_sink`, and varlen `score_mod` can fall back compatibly onto the stable Windows shim. The new `runtime_compat/` package fixes the raw CUDA / `nvidia_cutlass_dsl` import mismatch directly, and `cutlass_runtime/` promotes the repo's Windows probe `cutlass` package into a normal top-level import path. That means the remaining blocker is no longer package discovery. It is the real runtime layer behind `cutlass.cute.compile` and related cubin-load hooks. The current stable path is still the Windows compatibility shim and selective bridge objects rather than a true native FA4 kernel path.
 
 Current checkpoint caveat:
 
