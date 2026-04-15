@@ -14,6 +14,7 @@ surface that FA4 expects.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -122,14 +123,20 @@ def _noop_load_cubin_module_data(*args, **kwargs):
 
 
 if "base_dsl" not in globals():
-    base_dsl = SimpleNamespace(
-        runtime=SimpleNamespace(
-            cuda=SimpleNamespace(load_cubin_module_data=_noop_load_cubin_module_data)
+    try:
+        base_dsl = importlib.import_module("cutlass.base_dsl")
+    except Exception:
+        base_dsl = SimpleNamespace(
+            runtime=SimpleNamespace(
+                cuda=SimpleNamespace(load_cubin_module_data=_noop_load_cubin_module_data)
+            )
         )
-    )
 
 if "pipeline" not in globals():
-    pipeline = ProbePlaceholder("cutlass.pipeline")
+    try:
+        pipeline = importlib.import_module("cutlass.pipeline")
+    except Exception:
+        pipeline = ProbePlaceholder("cutlass.pipeline")
 
 
 class Constexpr:

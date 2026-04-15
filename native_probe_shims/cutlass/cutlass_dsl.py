@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from _probe_helpers import ProbePlaceholder, module_getattr, passthrough_decorator
 
 
@@ -13,6 +15,32 @@ class JitCompiledFunction:
     def export_to_c(self, *args, **kwargs):
         del args, kwargs
         return None
+
+
+class CudaDialectJitCompiledFunction(JitCompiledFunction):
+    def __init__(self, cubin_data=None, function_name: str | None = None, num_devices: int = 1):
+        self.cubin_data = cubin_data
+        self.function_name = function_name
+        self.num_devices = int(num_devices)
+        self._loaded_module = None
+
+    def _load_cuda_library(self):
+        if self._loaded_module is None:
+            if self.cubin_data is None:
+                raise RuntimeError("No cubin data is attached to this CudaDialectJitCompiledFunction")
+            from cutlass.base_dsl.runtime import cuda as runtime_cuda
+
+            self._loaded_module = runtime_cuda.load_cubin_module_data(self.cubin_data)
+        return [self._loaded_module]
+
+    def load_function(self, function_name: str | None = None):
+        name = function_name or self.function_name
+        if not name:
+            raise RuntimeError("No function name is attached to this CudaDialectJitCompiledFunction")
+        from cutlass.base_dsl.runtime import cuda as runtime_cuda
+
+        module = self._load_cuda_library()[0]
+        return runtime_cuda.get_module_function(module, name)
 
 
 class _ProbeDSL:
@@ -54,5 +82,8 @@ def and_(*values):
 
 def or_(*values):
     return any(bool(value) for value in values)
+
+
+cuda_jit_executor = SimpleNamespace(CudaDialectJitCompiledFunction=CudaDialectJitCompiledFunction)
 
 __getattr__ = module_getattr("cutlass.cutlass_dsl")

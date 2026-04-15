@@ -217,6 +217,7 @@ blocker without pretending the backend is fully implemented.
 Current probe result:
 
 - `scripts/probe_cutlass_runtime.py` now reports which CUTLASS package the native probe actually selected
+- `scripts/probe_cutlass_cubin_loader.py` now also compiles a tiny NVRTC kernel and verifies that the Windows runtime shim can load, resolve, and unload it
 - the repo-local editable package under `runtime_compat/` now fixes the raw Windows import mismatch directly:
   - `cuda` becomes importable as a regular package with `__version__`, `cuda`, `cudart`, and `nvrtc`
   - `nvidia_cutlass_dsl` becomes importable as a real top-level module name
@@ -237,6 +238,7 @@ Current probe result:
 - recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
 - `scripts/probe_native_fa4_backward.py` still reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs after the compat package is installed
 - the backward bridge now also preserves forward-only feature metadata across the preprocess step so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim
+- `native_probe_shims/cutlass/base_dsl/runtime/cuda.py` now uses the CUDA runtime-library path (`cudaLibraryLoadData`, `cudaLibraryGetKernel`, `cudaLibraryUnload`) instead of the failing driver-module path (`cuModuleLoadData`)
 - `scripts/patch_flash_attn_sm120_backward.py` now reapplies the local SM120 `dQ_single_wg = False` fix idempotently instead of relying on memory
 
 This is more real than the earlier placeholder probe, but it is still not native CuTe codegen yet.
@@ -290,6 +292,14 @@ Observed widened modifier probe output:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
 
+Observed cubin loader probe output:
+
+- `cutlass_spec` resolves through `cutlass_runtime/src/cutlass/__init__.py`
+- `runtime_cuda_module` resolves through `native_probe_shims/cutlass/base_dsl/runtime/cuda.py`
+- `cudaLibraryLoadData` succeeds on an NVRTC-built cubin
+- `cudaLibraryGetKernel` resolves the probe kernel successfully
+- `cudaLibraryUnload` succeeds cleanly
+
 So the modifier surface is now much cleaner:
 
 - dense `softcap`, `learnable_sink`, and `mask_mod` are stable on the native probe bridge path in both forward and backward parity probes
@@ -297,8 +307,8 @@ So the modifier surface is now much cleaner:
 - varlen `seqused_q` / `seqused_k` and the mixed `seqused + score_mod` backward path are now also stable on the native probe bridge path
 
 That means the main forward path is no longer blocked by a dead placeholder for these recognized
-kernels. The next real missing piece is still a usable CuTe DSL compiler/runtime
-implementation behind:
+kernels, and the low-level Windows cubin hook is no longer dead either. The next real missing piece
+is still a usable CuTe DSL compiler/runtime implementation behind:
 
 - `cutlass.cute.compile`
 - related runtime / cubin load hooks
@@ -321,7 +331,8 @@ At the moment this repo contains:
 - a precise native FA4 blocker chain:
   - raw CUDA / `nvidia_cutlass_dsl` import mismatch, now fixed by `runtime_compat/`
   - missing top-level `cutlass.cute`, now fixed by `cutlass_runtime/`
-  - the remaining honest blocker: no true Windows CuTe DSL compiler/runtime behind that import surface
+  - direct cubin loading, now fixed by the runtime-library shim path
+  - the remaining honest blocker: no true end-to-end Windows CuTe DSL compiler/runtime behind that import surface
 - a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, and the mixed packed/padded varlen layouts
 
 It does **not** yet contain a verified native Windows FA4 runtime path.
@@ -331,7 +342,7 @@ It does **not** yet contain a verified native Windows FA4 runtime path.
 The next promising route is one of:
 
 1. Replace the current `cutlass_runtime/` wrapper plus legacy CUTLASS delegation with a true Windows `cutlass.cute` runtime package.
-2. Build or locate the real CuTe DSL compiler/runtime layer so `cutlass.cute.compile` and its runtime hooks stop resolving to probe placeholders.
+2. Build or locate the real CuTe DSL compiler/runtime layer so `cutlass.cute.compile` stops resolving recognized kernels to selective bridge objects.
 3. If Windows wheels do not materialize, build the missing CUTLASS DSL runtime from source or vendor the required pieces into a separate Windows-focused bridge layer.
 4. Keep both `runtime_compat/` and `cutlass_runtime/` small and installable so other Windows users can quickly reproduce the same honest blocker chain.
 5. Extend the shim only when more FA4 surface area is actually needed, keeping unsupported features explicit instead of silently approximated.
