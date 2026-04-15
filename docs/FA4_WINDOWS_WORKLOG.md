@@ -112,15 +112,12 @@
 - The root package, the top-level `cutlass.cute` package, the heavy compile bridge, the `base_dsl.runtime.cuda` loader path, and the currently imported `cutlass_dsl` / `pipeline` / `utils` / `_mlir` surfaces are now local.
 - The remaining blocker is no longer active `cutlass.*` leakage from `native_probe_shims`; it is that `cutlass.cute.compile` still resolves recognized kernels to repo-local bridge objects instead of a true compiled Windows CuTe/CUTLASS DSL backend.
 - The current probe mode is now `runtime-local-core`, which is better than `runtime-wrapper+legacy-core` but still not a true native compiler/runtime.
-- The live upstream file being patched is outside this repo tree:
-  - `..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
-  - the reproducible source of truth for that edit remains `scripts/patch_flash_attn_sm120_backward.py`
-  - the native probe scripts now auto-ensure that patch, so the dependency is explicit and reproducible instead of manual
+- The active `flash_attn.cute.interface` surface is now repo-local under `flash_attn_runtime/src/flash_attn/cute/interface.py`; the upstream clone is now a refresh source, not a live runtime dependency.
+- The public backward path now accepts dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod` through the replay bridge, and the native backward probe reports exact parity for those cases.
 
 ### Next sensible targets
 
-- Keep the patch script as the single source of truth for the external `interface.py` edits and re-run its verification after each upstream refresh.
-- If we want to eliminate the external live patch entirely, vendor or wrap the needed FA4 interface layer inside this repo instead of relying on `..\third_party\flash-attention-for-windows\...`.
+- Keep `scripts/sync_flash_attn_runtime_overlay.py` and `scripts/patch_flash_attn_sm120_backward.py` as the single source of truth for overlay refreshes after each upstream sync.
 - Extend validator/probe coverage only when new FA4 surface area is actually added.
 - Keep pushing the real blocker:
   - replacing `runtime-local-core` plus repo-local bridge objects with a genuine Windows CuTe/CUTLASS DSL runtime/compiler path.

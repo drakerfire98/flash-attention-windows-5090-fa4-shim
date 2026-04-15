@@ -268,7 +268,7 @@ Current probe result:
 - the backward bridge now also preserves forward-only feature metadata across the preprocess step so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim
 - `native_probe_shims/cutlass/base_dsl/runtime/cuda.py` now uses the CUDA runtime-library path (`cudaLibraryLoadData`, `cudaLibraryGetKernel`, `cudaLibraryUnload`) instead of the failing driver-module path (`cuModuleLoadData`)
 - `scripts/patch_flash_attn_sm120_backward.py` now reapplies the local SM120 `dQ_single_wg = False` fix and removes the public SM120 guard cluster idempotently instead of relying on memory
-- the native probe scripts now auto-ensure that external patch before import/execution and print `patched_interface=...` so the dependency stays explicit
+- the active `flash_attn.cute.interface` probe path is now repo-local under `flash_attn_runtime/`, and `scripts/sync_flash_attn_runtime_overlay.py` plus `scripts/patch_flash_attn_sm120_backward.py` keep that overlay refresh explicit and reproducible
 
 This is more real than the earlier placeholder probe, but it is still not native CuTe codegen yet.
 
@@ -408,7 +408,8 @@ At the moment this repo contains:
 - the heavy `cutlass.cute._compile_bridge` logic is now repo-local instead of loaded from `native_probe_shims/`
 - the `cutlass.base_dsl.runtime.cuda` loader path is now repo-local instead of resolving from `native_probe_shims/`
 - the currently imported `cutlass_dsl`, `pipeline`, `utils`, and `_mlir` surfaces are now also repo-local, and the native import probe reports `cutlass_shim_module_count=0`
-- a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, and the mixed packed/padded varlen layouts
+- a repo-local `flash_attn_runtime/` overlay that now owns the active `flash_attn.cute.interface` runtime path inside this repo
+- a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, the mixed packed/padded varlen layouts, and the public backward replay for dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod`
 
 It does **not** yet contain a verified native Windows FA4 runtime path.
 
@@ -419,6 +420,6 @@ The next promising route is one of:
 1. Build or locate the real CuTe DSL compiler/runtime layer so `cutlass.cute.compile` stops resolving recognized kernels to selective bridge objects.
 2. If Windows wheels do not materialize, build the missing CUTLASS DSL runtime from source or vendor the required pieces into a separate Windows-focused bridge layer.
 3. Keep both `runtime_compat/` and `cutlass_runtime/` small and installable so other Windows users can quickly reproduce the same honest blocker chain.
-4. If we want to remove the external live patch dependency entirely, vendor or wrap the needed `flash_attn.cute.interface` surface inside this repo instead of relying on `..\third_party\flash-attention-for-windows\...`.
+4. Keep the repo-local overlay refresh flow (`scripts/sync_flash_attn_runtime_overlay.py`) healthy so future upstream syncs do not regress the active Windows runtime path.
 5. Extend the shim only when more FA4 surface area is actually needed, keeping unsupported features explicit instead of silently approximated.
 6. Re-test native FA4 when upstream or community Windows packaging for the CUTLASS DSL layer matures.

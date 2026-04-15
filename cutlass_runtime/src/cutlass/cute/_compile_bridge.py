@@ -514,8 +514,14 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
         shim = _load_windows_shim_module()
         dlse = _DLSE_BY_DQACCUM.pop(dq_accum.data_ptr(), None)
         compat_metadata = _BWD_METADATA_BY_DQACCUM.pop(dq_accum.data_ptr(), {})
+        kernel_score_mod = getattr(self.kernel, "score_mod", None)
+        composed_softcap, _ = _extract_softcap_score_mod_components(kernel_score_mod)
         softcap_value = 0.0 if softcap is None else float(softcap)
-        if softcap_value == 0.0:
+        if composed_softcap is not None:
+            # The backward kernel already carries a score_mod wrapper that folds
+            # softcap into the score transform, so replay should not re-apply it.
+            softcap_value = 0.0
+        elif softcap_value == 0.0:
             softcap_value = float(compat_metadata.get("softcap", 0.0) or 0.0)
         with torch.enable_grad():
             q_req = q.detach().clone().requires_grad_(True)
@@ -528,7 +534,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                 return_lse=dlse is not None,
             )
             is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k))
-            score_mod = getattr(self.kernel, "score_mod", None) or compat_metadata.get("score_mod")
+            score_mod = kernel_score_mod or compat_metadata.get("score_mod")
             mask_mod = getattr(self.kernel, "mask_mod", None) or compat_metadata.get("mask_mod")
             learnable_sink = compat_metadata.get("learnable_sink")
             if aux_tensors is None:

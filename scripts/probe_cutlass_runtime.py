@@ -8,9 +8,10 @@ from importlib import util
 from importlib import metadata
 
 from _native_probe_setup import (
-    ensure_native_fa4_patch,
     install_native_probe_paths,
     loaded_cutlass_shim_modules,
+    loaded_flash_attn_overlay_modules,
+    native_flash_attn_interface_path,
 )
 
 
@@ -70,21 +71,23 @@ def main() -> int:
     print(f"raw_cutlass_dist={_dist_version('cutlass')}")
     print(f"raw_nvidia_cutlass_dsl_dist={_dist_version('nvidia-cutlass-dsl')}")
     print(f"nvidia_cutlass_dsl_requires={_dist_requires('nvidia-cutlass-dsl')}")
-    runtime_src, shim_root = install_native_probe_paths()
-    patched_target = ensure_native_fa4_patch()
+    flash_attn_runtime_src, runtime_src, shim_root = install_native_probe_paths()
+    interface_target = native_flash_attn_interface_path()
 
     import cutlass
     import cutlass.cute as cute
     import cutlass.cute._compile_bridge as cute_compile_bridge
     import cutlass.base_dsl.runtime.cuda as runtime_cuda_module
     import flash_attn.cute as fa4
+    import flash_attn.cute.interface as fa4_interface
 
     print(f"cutlass_dist={_dist_version('cutlass')}")
     print(f"nvidia_cutlass_dsl_dist={_dist_version('nvidia-cutlass-dsl')}")
     print(f"flash_attn_4_dist={_dist_version('flash-attn-4')}")
     print(f"native_probe_shims={shim_root}")
+    print(f"flash_attn_runtime_src={flash_attn_runtime_src}")
     print(f"cutlass_runtime_src={runtime_src}")
-    print(f"patched_interface={patched_target}")
+    print(f"native_interface={interface_target}")
     print(f"cutlass_file={getattr(cutlass, '__file__', '<missing>')}")
     print(f"cutlass_probe_mode={getattr(cutlass, 'NATIVE_PROBE_MODE', '<unknown>')}")
     print(f"cutlass_probe_init={getattr(cutlass, 'NATIVE_PROBE_CUTLASS_INIT', '<unknown>')}")
@@ -99,6 +102,7 @@ def main() -> int:
     print(f"pycute_loaded={'pycute' in sys.modules}")
     print(f"runtime_cuda_file={getattr(runtime_cuda_module, '__file__', '<missing>')}")
     print(f"flash_attn_cute_file={getattr(fa4, '__file__', '<missing>')}")
+    print(f"flash_attn_cute_interface_file={getattr(fa4_interface, '__file__', '<missing>')}")
 
     runtime_cuda = getattr(getattr(getattr(cutlass, "base_dsl", None), "runtime", None), "cuda", None)
     load_cubin = getattr(runtime_cuda, "load_cubin_module_data", None)
@@ -108,6 +112,10 @@ def main() -> int:
     print(f"cutlass_shim_module_count={len(shim_modules)}")
     for name, path in shim_modules:
         print(f"cutlass_shim_module={name} -> {path}")
+    overlay_modules = loaded_flash_attn_overlay_modules()
+    print(f"flash_attn_overlay_module_count={len(overlay_modules)}")
+    for name, path in overlay_modules:
+        print(f"flash_attn_overlay_module={name} -> {path}")
 
     blockers: list[str] = []
     if "third_party\\flash-attention-for-windows\\csrc\\cutlass\\python\\cutlass\\__init__.py" in raw_cutlass_spec.lower():
@@ -132,6 +140,10 @@ def main() -> int:
         blockers.append("cutlass.base_dsl.runtime.cuda is not resolving from the repo-local runtime package")
     if shim_modules:
         blockers.append("some cutlass modules still resolved from native_probe_shims")
+    if "flash_attn_runtime\\src\\flash_attn\\cute\\__init__.py" not in str(getattr(fa4, "__file__", "")).lower():
+        blockers.append("flash_attn.cute is not resolving from the repo-local runtime overlay")
+    if "flash_attn_runtime\\src\\flash_attn\\cute\\interface.py" not in str(getattr(fa4_interface, "__file__", "")).lower():
+        blockers.append("flash_attn.cute.interface is not resolving from the repo-local runtime overlay")
     print(f"modern_runtime_ready={len(blockers) == 0}")
     print(f"modern_runtime_blockers={blockers}")
     return 0

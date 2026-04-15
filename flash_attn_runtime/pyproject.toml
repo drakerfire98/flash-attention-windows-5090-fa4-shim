@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fa4-windows-flash-attn-runtime"
+version = "0.1.0"
+description = "Repo-owned FlashAttention CUTE overlay for the Windows FA4 probe path"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "drakerfire98"},
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["flash_attn", "flash_attn.cute"]
