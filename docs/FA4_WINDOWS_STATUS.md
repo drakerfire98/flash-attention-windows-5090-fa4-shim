@@ -252,12 +252,12 @@ Current probe result:
 - recognized FA4 forward-combine `cute.compile(...)` calls now also return a real `NativeProbeForwardCombineBridge`
 - that forward-combine bridge now also handles `num_splits_dynamic_ptr`, with exact parity in both the batched and varlen dynamic-split probe cases
 - recognized FA4 `compute_block_sparsity(...)` `cute.compile(...)` calls now also return a real `NativeProbeBlockSparsityBridge`
-- the forward bridge now also supports end-to-end block-sparse execution onto the stable Windows shim path, with exact parity in the direct bridge probe case
+- the forward bridge now also supports end-to-end block-sparse execution onto the stable Windows shim path
 - recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
 - `scripts/probe_native_fa4_backward.py` still reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs after the compat package is installed
 - the backward bridge now also preserves forward-only feature metadata across the preprocess step so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim
 - `native_probe_shims/cutlass/base_dsl/runtime/cuda.py` now uses the CUDA runtime-library path (`cudaLibraryLoadData`, `cudaLibraryGetKernel`, `cudaLibraryUnload`) instead of the failing driver-module path (`cuModuleLoadData`)
-- `scripts/patch_flash_attn_sm120_backward.py` now reapplies the local SM120 `dQ_single_wg = False` fix idempotently instead of relying on memory
+- `scripts/patch_flash_attn_sm120_backward.py` now reapplies the local SM120 `dQ_single_wg = False` fix and removes the public SM120 guard cluster idempotently instead of relying on memory
 
 This is more real than the earlier placeholder probe, but it is still not native CuTe codegen yet.
 
@@ -300,6 +300,9 @@ Observed widened modifier probe output:
 - dense `mask_mod` backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
+- dense block-sparse backward:
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
 - varlen `softcap` forward:
   - output max diff vs stable shim: `0.0`
   - LSE max diff vs stable shim: `0.0`
@@ -328,11 +331,13 @@ Observed block-sparsity probe output:
 - fast-sampling block-sparsity mask/full count and index tensors also match the stable Windows shim exactly
 - `compute_block_sparsity.compile_cache` now holds `NativeProbeBlockSparsityBridge`
 
-Observed direct block-sparse forward bridge output:
+Observed public SM120 block-sparse probe output:
 
-- dense block-sparse output max diff vs stable shim: `0.0`
-- dense block-sparse LSE max diff vs stable shim: `0.0`
-- this currently exercises `NativeProbeForwardBridge` directly because the upstream public SM120 wrapper still raises its own block-sparsity guard before the bridge can take over
+- dense block-sparse forward output max diff vs stable shim: `0.0`
+- dense block-sparse forward LSE max diff vs stable shim: `0.0`
+- dense block-sparse backward output max diff vs stable shim: `0.0`
+- dense block-sparse backward grad max diff vs stable shim: `0.0`
+- the upstream public `flash_attn_func(...)` wrapper now reaches `NativeProbeForwardBridge` / `NativeProbeBackwardBridge` cleanly on SM120 for this tested block-sparse path
 
 Observed cubin loader probe output:
 

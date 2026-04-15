@@ -79,6 +79,33 @@ def _tensor_ptr(tensor: torch.Tensor | None) -> int | None:
     return None if tensor is None else int(tensor.data_ptr())
 
 
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _resolve_block_size(
+    *,
+    q_seqlen: int,
+    tile_m: int,
+    tile_n: int,
+    block_sparse_tensors: Any,
+    q_subtile_factor: int | None,
+) -> tuple[int, int]:
+    if q_subtile_factor is None:
+        count_tensor = None
+        if block_sparse_tensors is not None:
+            count_tensor = block_sparse_tensors[0]
+            if count_tensor is None and len(block_sparse_tensors) >= 3:
+                count_tensor = block_sparse_tensors[2]
+        if count_tensor is None or count_tensor.shape[-1] <= 0:
+            q_subtile_factor = 1
+        else:
+            sparse_m_blocks = int(count_tensor.shape[-1])
+            sparse_block_size_q = _ceil_div(_ceil_div(q_seqlen, sparse_m_blocks), tile_m) * tile_m
+            q_subtile_factor = max(1, sparse_block_size_q // tile_m)
+    return (tile_m * q_subtile_factor, tile_n)
+
+
 def _stash_forward_metadata(
     out: torch.Tensor | None,
     lse: torch.Tensor | None,
@@ -89,6 +116,8 @@ def _stash_forward_metadata(
     learnable_sink: torch.Tensor | None,
     aux_tensors: list[torch.Tensor] | None,
     page_table: torch.Tensor | None,
+    block_sparse_tensors: Any,
+    block_size: tuple[int, int] | None,
 ) -> None:
     keys = tuple(ptr for ptr in (_tensor_ptr(out), _tensor_ptr(lse)) if ptr is not None)
     if not keys:
@@ -101,6 +130,8 @@ def _stash_forward_metadata(
         "learnable_sink": learnable_sink,
         "aux_tensors": aux_tensors,
         "page_table": page_table,
+        "block_sparse_tensors": block_sparse_tensors,
+        "block_size": block_size,
     }
     for key in keys:
         _FWD_METADATA_BY_TENSOR_PTR[key] = metadata
@@ -194,9 +225,17 @@ class NativeProbeForwardBridge(JitCompiledFunction):
             if is_varlen:
                 raise NotImplementedError("Block-sparse native probe bridge does not yet support varlen sequences")
             mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = block_sparse_tensors
-            q_subtile_factor = int(getattr(self.kernel, "q_subtile_factor", 1) or 1)
+            kernel_q_subtile_factor = getattr(self.kernel, "q_subtile_factor", None)
+            q_subtile_factor = None if kernel_q_subtile_factor is None else int(kernel_q_subtile_factor or 1)
             tile_m = int(getattr(self.kernel, "tile_m", getattr(self.kernel, "m_block_size", q.shape[1])))
             tile_n = int(getattr(self.kernel, "tile_n", getattr(self.kernel, "n_block_size", k.shape[1])))
+            block_size = _resolve_block_size(
+                q_seqlen=int(q.shape[1]),
+                tile_m=tile_m,
+                tile_n=tile_n,
+                block_sparse_tensors=block_sparse_tensors,
+                q_subtile_factor=q_subtile_factor,
+            )
             shim_out, shim_lse = shim._attention_forward_block_sparse(
                 q,
                 k,
@@ -212,7 +251,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                 full_block_idx=full_block_idx,
                 mask_block_cnt=mask_block_cnt,
                 mask_block_idx=mask_block_idx,
-                block_size=(tile_m * q_subtile_factor, tile_n),
+                block_size=block_size,
                 aux_tensors=aux_tensors,
                 batch_start_index=0,
                 offset_q=0,
@@ -220,6 +259,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                 return_lse=lse is not None,
             )
         elif is_varlen:
+            block_size = None
             shim_out, shim_lse = shim.flash_attn_varlen_func(
                 q,
                 k,
@@ -235,6 +275,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                 **common,
             )
         elif score_mod is not None:
+            block_size = None
             shim_out, shim_lse = shim._attention_forward_dense(
                 q,
                 k,
@@ -249,6 +290,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                 **common,
             )
         else:
+            block_size = None
             shim_out, shim_lse = shim.flash_attn_func(
                 q,
                 k,
@@ -269,6 +311,8 @@ class NativeProbeForwardBridge(JitCompiledFunction):
             learnable_sink=learnable_sink,
             aux_tensors=aux_tensors,
             page_table=page_table,
+            block_sparse_tensors=block_sparse_tensors,
+            block_size=block_size,
         )
 
 
@@ -356,8 +400,6 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
         block_sparse_tensors: Any,
     ) -> None:
         del lse_log2, dpsum, dq_semaphore, dk_semaphore, dv_semaphore
-        if block_sparse_tensors is not None:
-            raise NotImplementedError("Block-sparse native probe backward bridge is not implemented yet")
 
         shim = _load_windows_shim_module()
         dlse = _DLSE_BY_DQACCUM.pop(dq_accum.data_ptr(), None)
@@ -385,8 +427,48 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
             if aux_tensors is None:
                 aux_tensors = compat_metadata.get("aux_tensors")
             page_table = compat_metadata.get("page_table")
+            compat_block_sparse_tensors = compat_metadata.get("block_sparse_tensors")
+            compat_block_size = compat_metadata.get("block_size")
+            if compat_block_sparse_tensors is not None:
+                block_sparse_tensors = compat_block_sparse_tensors
+            elif block_sparse_tensors is not None:
+                raise NotImplementedError(
+                    "Block-sparse native probe backward requires forward metadata from the bridged forward path"
+                )
 
-            if is_varlen:
+            if block_sparse_tensors is not None:
+                if is_varlen:
+                    raise NotImplementedError(
+                        "Block-sparse native probe backward bridge does not yet support varlen sequences"
+                    )
+                if compat_block_size is None:
+                    raise NotImplementedError(
+                        "Block-sparse native probe backward bridge is missing the original block size metadata"
+                    )
+                mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = block_sparse_tensors
+                shim_out, shim_lse = shim._attention_forward_block_sparse(
+                    q_req,
+                    k_req,
+                    v_req,
+                    softmax_scale=softmax_scale,
+                    causal=bool(getattr(self.kernel, "is_causal", False)),
+                    window_size=_window_tuple(window_size_left, window_size_right),
+                    learnable_sink=learnable_sink,
+                    softcap=softcap_value,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    full_block_cnt=full_block_cnt,
+                    full_block_idx=full_block_idx,
+                    mask_block_cnt=mask_block_cnt,
+                    mask_block_idx=mask_block_idx,
+                    block_size=compat_block_size,
+                    aux_tensors=aux_tensors,
+                    batch_start_index=0,
+                    offset_q=0,
+                    offset_k=0,
+                    return_lse=dlse is not None,
+                )
+            elif is_varlen:
                 shim_out, shim_lse = shim.flash_attn_varlen_func(
                     q_req,
                     k_req,

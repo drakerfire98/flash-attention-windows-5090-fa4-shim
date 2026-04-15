@@ -212,6 +212,72 @@ def _run_dense_mask_mod(native_flash_attn_func, shim_mod):
     print(f"dense_mask_mod_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
 
 
+def _run_dense_block_sparse(native_flash_attn_func, shim_mod):
+    torch.manual_seed(43)
+    q = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    def striped_block_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        del batch_idx, head_idx, seqlen_info, aux_tensors
+        return (kv_idx <= q_idx) & (((q_idx + kv_idx) % 3) != 1)
+
+    _, sparse_tensors = shim_mod.compute_block_sparsity(
+        256,
+        128,
+        1,
+        1,
+        256,
+        256,
+        striped_block_mask,
+        None,
+        torch.device("cuda"),
+        compute_full_blocks=True,
+    )
+
+    native_out, native_lse = native_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        return_lse=True,
+        mask_mod=striped_block_mask,
+        full_block_cnt=sparse_tensors.full_block_cnt,
+        full_block_idx=sparse_tensors.full_block_idx,
+        mask_block_cnt=sparse_tensors.mask_block_cnt,
+        mask_block_idx=sparse_tensors.mask_block_idx,
+        block_size=sparse_tensors.block_size,
+    )
+    native_loss = native_out.float().sum() + 0.05 * native_lse.float().masked_fill(torch.isneginf(native_lse), 0.0).sum()
+    native_loss.backward()
+    native_grads = (q.grad.detach().clone(), k.grad.detach().clone(), v.grad.detach().clone())
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    ref_out, ref_lse = shim_mod.flash_attn_func(
+        q_ref,
+        k_ref,
+        v_ref,
+        causal=False,
+        return_lse=True,
+        mask_mod=striped_block_mask,
+        full_block_cnt=sparse_tensors.full_block_cnt,
+        full_block_idx=sparse_tensors.full_block_idx,
+        mask_block_cnt=sparse_tensors.mask_block_cnt,
+        mask_block_idx=sparse_tensors.mask_block_idx,
+        block_size=sparse_tensors.block_size,
+    )
+    ref_loss = ref_out.float().sum() + 0.05 * ref_lse.float().masked_fill(torch.isneginf(ref_lse), 0.0).sum()
+    ref_loss.backward()
+    ref_grads = (q_ref.grad.detach().clone(), k_ref.grad.detach().clone(), v_ref.grad.detach().clone())
+
+    print("case=dense_block_sparse")
+    print(f"dense_block_sparse_out_max_diff={(native_out.float() - ref_out.float()).abs().max().item()}")
+    print(f"dense_block_sparse_grad_max_diff={_max_grad_diff(native_grads, ref_grads)}")
+    print(f"dense_block_sparse_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
+
+
 def _run_dense_softcap(native_flash_attn_func, shim_mod):
     torch.manual_seed(5)
     q = torch.randn(1, 12, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -312,6 +378,7 @@ def main() -> int:
         lambda: _run_dense_softcap(flash_attn_func, shim_mod),
         lambda: _run_dense_learnable_sink(flash_attn_func, shim_mod),
         lambda: _run_dense_mask_mod(flash_attn_func, shim_mod),
+        lambda: _run_dense_block_sparse(flash_attn_func, shim_mod),
         lambda: _run_varlen(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused_score_mod(flash_attn_varlen_func, shim_mod),

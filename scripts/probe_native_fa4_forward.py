@@ -157,7 +157,7 @@ def _run_dense_mask_mod(native_flash_attn_func, shim_mod):
     _print_case_metrics("dense_mask_mod", native_out, ref_out, native_lse, ref_lse)
 
 
-def _run_dense_block_sparse(iface, shim_mod):
+def _run_dense_block_sparse(native_flash_attn_func, shim_mod):
     torch.manual_seed(41)
     q = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
@@ -179,43 +179,18 @@ def _run_dense_block_sparse(iface, shim_mod):
         torch.device("cuda"),
         compute_full_blocks=True,
     )
-    from types import SimpleNamespace
-    from cutlass.cute._compile_bridge import NativeProbeForwardBridge
-
-    bridge = NativeProbeForwardBridge(
-        SimpleNamespace(
-            is_causal=False,
-            score_mod=None,
-            mask_mod=striped_block_mask,
-            tile_m=128,
-            tile_n=128,
-            q_subtile_factor=2,
-        )
-    )
-    native_out = torch.empty_like(q)
-    native_lse = torch.empty((q.shape[0], q.shape[2], q.shape[1]), device="cuda", dtype=torch.float32)
-    bridge(
+    native_out, native_lse = native_flash_attn_func(
         q,
         k,
         v,
-        native_out,
-        native_lse,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        (
-            sparse_tensors.mask_block_cnt,
-            sparse_tensors.mask_block_idx,
-            sparse_tensors.full_block_cnt,
-            sparse_tensors.full_block_idx,
-        ),
-        None,
+        causal=False,
+        mask_mod=striped_block_mask,
+        full_block_cnt=sparse_tensors.full_block_cnt,
+        full_block_idx=sparse_tensors.full_block_idx,
+        mask_block_cnt=sparse_tensors.mask_block_cnt,
+        mask_block_idx=sparse_tensors.mask_block_idx,
+        block_size=sparse_tensors.block_size,
+        return_lse=True,
     )
     ref_out, ref_lse = shim_mod.flash_attn_func(
         q,
@@ -361,7 +336,7 @@ def main() -> int:
         lambda: _run_dense_softcap(flash_attn_func, shim_mod),
         lambda: _run_dense_learnable_sink(flash_attn_func, shim_mod),
         lambda: _run_dense_mask_mod(flash_attn_func, shim_mod),
-        lambda: _run_dense_block_sparse(iface, shim_mod),
+        lambda: _run_dense_block_sparse(flash_attn_func, shim_mod),
         lambda: _run_varlen_softcap(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_score_mod(flash_attn_varlen_func, shim_mod),
