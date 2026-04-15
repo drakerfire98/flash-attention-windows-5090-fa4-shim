@@ -39,7 +39,8 @@ std::vector<torch::Tensor> dense_forward_chunk(
     int64_t window_left,
     int64_t window_right,
     double softcap,
-    const c10::optional<torch::Tensor>& learnable_sink_opt) {
+    const c10::optional<torch::Tensor>& learnable_sink_opt,
+    const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
   TORCH_CHECK(q.dim() == 4, "q chunk must be shaped (batch, seqlen_q, heads, dim)");
   TORCH_CHECK(k.dim() == 4, "k chunk must be shaped (batch, seqlen_k, heads, dim)");
   TORCH_CHECK(v.dim() == 4, "v chunk must be shaped (batch, seqlen_k, heads, dim_v)");
@@ -74,6 +75,19 @@ std::vector<torch::Tensor> dense_forward_chunk(
                          scores.device())
                          .view({1, 1, q.size(1), k.size(1)});
     scores = scores.masked_fill(~keep_mask, -std::numeric_limits<float>::infinity());
+  }
+  if (extra_keep_mask_opt.has_value() && extra_keep_mask_opt.value().defined()) {
+    auto extra_keep_mask = extra_keep_mask_opt.value().to(scores.device(), torch::kBool);
+    TORCH_CHECK(
+        extra_keep_mask.dim() == 4,
+        "extra_keep_mask chunk must be shaped (batch, heads, seqlen_q, seqlen_k)");
+    TORCH_CHECK(
+        extra_keep_mask.size(0) == scores.size(0) &&
+            extra_keep_mask.size(1) == scores.size(1) &&
+            extra_keep_mask.size(2) == scores.size(2) &&
+            extra_keep_mask.size(3) == scores.size(3),
+        "extra_keep_mask chunk shape must match the expanded attention score shape");
+    scores = scores.masked_fill(~extra_keep_mask, -std::numeric_limits<float>::infinity());
   }
   if (softcap > 0.0) {
     scores = torch::tanh(scores / softcap) * softcap;
@@ -143,7 +157,8 @@ std::vector<torch::Tensor> flash_attn_varlen_forward(
     int64_t window_left,
     int64_t window_right,
     double softcap,
-    const c10::optional<torch::Tensor>& learnable_sink_opt) {
+    const c10::optional<torch::Tensor>& learnable_sink_opt,
+    const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
   TORCH_CHECK(q.device() == k.device(), "q and k must be on the same device");
   TORCH_CHECK(q.device() == v.device(), "q and v must be on the same device");
   TORCH_CHECK(
@@ -172,6 +187,15 @@ std::vector<torch::Tensor> flash_attn_varlen_forward(
   const auto batch = q_used_cpu.numel();
   const auto q_heads = q_packed ? q.size(1) : q.size(2);
   const auto v_dim = v.size(-1);
+  if (extra_keep_mask_opt.has_value() && extra_keep_mask_opt.value().defined()) {
+    auto extra_keep_mask = extra_keep_mask_opt.value();
+    TORCH_CHECK(
+        extra_keep_mask.dim() == 4,
+        "extra_keep_mask must be shaped (batch, heads, max_q, max_k)");
+    TORCH_CHECK(
+        extra_keep_mask.size(0) == batch && extra_keep_mask.size(1) == q_heads,
+        "extra_keep_mask batch/head dims must match the q layout");
+  }
 
   if (q_packed) {
     TORCH_CHECK(q.dim() == 3, "packed q must be shaped (total_q, heads, dim)");
@@ -239,6 +263,13 @@ std::vector<torch::Tensor> flash_attn_varlen_forward(
 
     torch::Tensor out_chunk;
     torch::Tensor lse_chunk;
+    c10::optional<torch::Tensor> extra_keep_mask_chunk = c10::nullopt;
+    if (extra_keep_mask_opt.has_value() && extra_keep_mask_opt.value().defined()) {
+        extra_keep_mask_chunk = extra_keep_mask_opt.value()
+            .narrow(0, batch_idx, 1)
+            .narrow(2, 0, q_len)
+            .narrow(3, 0, k_len);
+    }
     if (q_len == 0 || k_len == 0) {
       out_chunk = torch::zeros({1, q_len, q_heads, v_dim}, q.options());
       lse_chunk = torch::full(
@@ -255,7 +286,8 @@ std::vector<torch::Tensor> flash_attn_varlen_forward(
           window_left,
           window_right,
           softcap,
-          learnable_sink_opt);
+          learnable_sink_opt,
+          extra_keep_mask_chunk);
       out_chunk = chunk_result[0];
       lse_chunk = chunk_result[1];
     }

@@ -85,6 +85,18 @@
 - Expanded `scripts/validate_fa4_windows_shim.py`:
   - added broader validator coverage for varlen paged-KV forward/backward parity
   - added broader validator coverage for combined varlen `softcap + score_mod` forward/backward parity
+- Added a repo-owned local attention runtime core under `cutlass_runtime/src/cutlass/cute/_runtime_local_core.py`:
+  - the compile bridge now uses local dense / varlen attention replay helpers instead of directly loading `shims/flash_attn/cute`
+  - the same local core now owns dense / varlen keep-mask materialization for modifier families
+  - the same local core now owns block-sparse tensor filling for the native block-sparsity bridge
+- Extended the compiled dense / varlen backend slices so the bridge can push keep-mask driven modifier paths into compiled native slices:
+  - `cutlass_runtime/src/cutlass/cute/_native_dense_backend.cpp` / `.py` now accept `extra_keep_mask`
+  - `cutlass_runtime/src/cutlass/cute/_native_varlen_backend.cpp` / `.py` now accept `extra_keep_mask`
+  - dense `mask_mod` and dense block-sparse forward now hit the compiled dense backend with `last_call=extra_keep_mask`
+  - varlen modifier families now hit the compiled varlen backend with `last_call=...+extra_keep_mask`
+- Removed the last direct runtime dependency on the stable shim for forward-combine fallback:
+  - `cutlass_runtime/src/cutlass/cute/_native_backend.py` now includes a repo-owned local combine implementation
+  - `cutlass_runtime/src/cutlass/cute/_compile_bridge.py` no longer imports or loads `shims/flash_attn/cute` for combine fallback
 
 ### Verification run
 
@@ -107,6 +119,12 @@
   - `already patched`
   - `verification=ok`
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_forward.py`
+  - `dense_score_mod_out_max_diff=0.0`
+  - `dense_block_sparse_out_max_diff=0.0`
+  - `varlen_score_mod_out_max_diff=0.0`
+  - `varlen_seqused_score_mod_out_max_diff=0.0`
+  - `native_dense_backend_post["last_call"] = "extra_keep_mask"`
+  - `native_varlen_backend_post["last_call"] = "padded_q+padded_k+extra_keep_mask"`
   - `varlen_paged_kv_out_max_diff=0.0`
   - `varlen_paged_kv_lse_max_diff=0.0`
   - `varlen_softcap_score_mod_out_max_diff=0.0`
@@ -140,6 +158,9 @@
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_combine.py`
   - `patched_interface=..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
   - all tested combine parity cases remain exact
+- `FA4_WINDOWS_NATIVE_COMBINE_DISABLE=1 .\.venv_fa4\Scripts\python.exe ...`
+  - `combine_fallback_out_finite=True`
+  - `combine_fallback_lse_finite=True`
 - `.\.venv_fa4\Scripts\python.exe scripts\validate_fa4_windows_shim.py`
   - `validation=ok`
   - `varlen_paged_kv_out_max_diff=0.0`
@@ -151,7 +172,7 @@
 
 - The environment is still not a true Windows-native CuTe/CUTLASS DSL runtime.
 - The root package, the top-level `cutlass.cute` package, the heavy compile bridge, the `base_dsl.runtime.cuda` loader path, and the currently imported `cutlass_dsl` / `pipeline` / `utils` / `_mlir` surfaces are now local.
-- The remaining blocker is no longer active `cutlass.*` leakage from `native_probe_shims`; the forward-combine family, the broader plain dense forward family, the broader plain varlen forward family, and the backward helper family now build through real compiled Windows extensions, but the rest of `cutlass.cute.compile` still resolves recognized kernels to repo-local bridge objects instead of a true compiled Windows CuTe/CUTLASS DSL backend.
+- The remaining blocker is no longer active `cutlass.*` leakage from `native_probe_shims` or a direct runtime dependency on `shims/flash_attn/cute`; the forward-combine family, the broader plain dense forward family, the broader plain varlen forward family, and the backward helper family now build through real compiled Windows extensions, and the modifier families now route through repo-owned local runtime code, but the rest of `cutlass.cute.compile` still resolves recognized kernels to repo-local bridge objects instead of a true compiled Windows CuTe/CUTLASS DSL backend.
 - The current probe mode is now `runtime-local-core`, which is better than `runtime-wrapper+legacy-core` but still not a true native compiler/runtime.
 - The active `flash_attn.cute.interface` surface is now repo-local under `flash_attn_runtime/src/flash_attn/cute/interface.py`; the upstream clone is now a refresh source, not a live runtime dependency.
 - The public backward path now accepts dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod` through the replay bridge, and the native backward probe reports exact parity for those cases.

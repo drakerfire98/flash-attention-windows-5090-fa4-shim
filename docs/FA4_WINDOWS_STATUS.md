@@ -258,12 +258,14 @@ Current probe result:
   - Unix-only `fcntl`
 - `scripts/probe_native_fa4_forward.py` now reaches a tiny CUDA forward call through that native path
 - recognized FA4 forward-kernel `cute.compile(...)` calls now return a real `NativeProbeForwardBridge` object instead of a dead placeholder
-- that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
+- that bridge now routes execution through repo-owned runtime code for the forward kernel families we currently recognize, only comparing back to the stable Windows shim in the probes
 - the broader plain dense forward family now also routes through a repo-built Windows extension module (`fa4_windows_native_dense_ext*.pyd`)
 - the broader plain varlen forward family now also routes through a repo-built Windows extension module (`fa4_win_varlen_ext*.pyd`)
+- the broader modifier path now routes through repo-owned runtime code in `cutlass_runtime/src/cutlass/cute/_runtime_local_core.py` plus compiled keep-mask slices, instead of directly replaying through the stable shim at runtime
 - recognized FA4 forward-combine `cute.compile(...)` calls now also return a real `NativeProbeForwardCombineBridge`
 - that forward-combine bridge now also handles `num_splits_dynamic_ptr`, with exact parity in both the batched and varlen dynamic-split probe cases
 - the forward-combine bridge now builds and loads a real Windows extension module (`fa4_windows_native_combine_ext*.pyd`) through `cutlass_runtime/src/cutlass/cute/_native_backend.py`
+- the forward-combine bridge no longer directly falls back to `shims/flash_attn/cute`; if the compiled combine extension is unavailable, it now falls back to a repo-owned local combine implementation in `cutlass_runtime/src/cutlass/cute/_native_backend.py`
 - recognized FA4 `compute_block_sparsity(...)` `cute.compile(...)` calls now also return a real `NativeProbeBlockSparsityBridge`
 - the forward bridge now also supports end-to-end block-sparse execution onto the stable Windows shim path
 - recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
@@ -314,6 +316,9 @@ Observed widened modifier probe output:
 - dense `mask_mod` backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
+- dense `score_mod` forward:
+  - output max diff vs stable shim: `0.0`
+  - LSE max diff vs stable shim: `0.0`
 - dense block-sparse backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
@@ -324,6 +329,12 @@ Observed widened modifier probe output:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
 - varlen `seqused_q` / `seqused_k` plus `score_mod` backward:
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
+- varlen paged-KV backward:
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
+- varlen internal block-sparse backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
 
@@ -338,6 +349,7 @@ Observed forward-combine probe output:
 - dynamic varlen combine output max diff vs stable shim: `0.0`
 - dynamic varlen combine LSE max diff vs stable shim: `0.0`
 - `_flash_attn_fwd_combine.compile_cache` now holds `NativeProbeForwardCombineBridge`
+- disabling `FA4_WINDOWS_NATIVE_COMBINE_DISABLE=1` now still leaves `flash_attn_combine(...)` usable through the repo-owned local combine fallback, with finite outputs and finite LSE
 
 Observed block-sparsity probe output:
 

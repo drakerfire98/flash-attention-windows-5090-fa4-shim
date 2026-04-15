@@ -49,7 +49,8 @@ std::vector<torch::Tensor> flash_attn_dense_forward(
     int64_t window_left,
     int64_t window_right,
     double softcap,
-    const c10::optional<torch::Tensor>& learnable_sink_opt) {
+    const c10::optional<torch::Tensor>& learnable_sink_opt,
+    const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
   TORCH_CHECK(q.dim() == 4, "q must be shaped (batch, seqlen_q, heads, dim)");
   TORCH_CHECK(k.dim() == 4, "k must be shaped (batch, seqlen_k, heads, dim)");
   TORCH_CHECK(v.dim() == 4, "v must be shaped (batch, seqlen_k, heads, dim_v)");
@@ -91,6 +92,19 @@ std::vector<torch::Tensor> flash_attn_dense_forward(
                          scores.device())
                          .view({1, 1, q.size(1), k.size(1)});
     scores = scores.masked_fill(~keep_mask, -std::numeric_limits<float>::infinity());
+  }
+  if (extra_keep_mask_opt.has_value() && extra_keep_mask_opt.value().defined()) {
+    auto extra_keep_mask = extra_keep_mask_opt.value().to(scores.device(), torch::kBool);
+    TORCH_CHECK(
+        extra_keep_mask.dim() == 4,
+        "extra_keep_mask must be shaped (batch, heads, seqlen_q, seqlen_k)");
+    TORCH_CHECK(
+        extra_keep_mask.size(0) == scores.size(0) &&
+            extra_keep_mask.size(1) == scores.size(1) &&
+            extra_keep_mask.size(2) == scores.size(2) &&
+            extra_keep_mask.size(3) == scores.size(3),
+        "extra_keep_mask shape must match the expanded attention score shape");
+    scores = scores.masked_fill(~extra_keep_mask, -std::numeric_limits<float>::infinity());
   }
   if (softcap > 0.0) {
     scores = torch::tanh(scores / softcap) * softcap;

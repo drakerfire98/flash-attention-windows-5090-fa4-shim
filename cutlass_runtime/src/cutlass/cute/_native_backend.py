@@ -302,6 +302,51 @@ def build_combine_split_valid_mask(
     return split_valid
 
 
+def _combine_split_attention_local(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    *,
+    split_valid_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if out_partial.ndim not in (4, 5):
+        raise ValueError("out_partial must have 4 or 5 dimensions")
+    if lse_partial.ndim != out_partial.ndim - 1:
+        raise ValueError("lse_partial rank must be exactly one less than out_partial rank")
+    if out_partial.shape[:-1] != lse_partial.shape:
+        raise ValueError("out_partial and lse_partial shapes are incompatible")
+    if out_partial.shape[0] == 0:
+        raise ValueError("out_partial must include at least one split")
+
+    lse_float = lse_partial.float()
+    valid = ~torch.isneginf(lse_float)
+    if split_valid_mask is not None:
+        if split_valid_mask.shape != lse_partial.shape:
+            raise ValueError("split_valid_mask must match lse_partial shape")
+        valid = valid & split_valid_mask
+    any_valid = valid.any(dim=0)
+    lse_max = torch.amax(lse_float, dim=0)
+    safe_lse_max = torch.where(any_valid, lse_max, torch.zeros_like(lse_max))
+
+    weights = torch.where(
+        valid,
+        torch.exp(lse_float - safe_lse_max.unsqueeze(0)),
+        torch.zeros_like(lse_float),
+    )
+    denom = weights.sum(dim=0)
+    numerator = (out_partial.float() * weights.unsqueeze(-1)).sum(dim=0)
+    out = torch.where(
+        denom.unsqueeze(-1) > 0,
+        numerator / denom.unsqueeze(-1),
+        torch.zeros_like(numerator),
+    )
+    lse = torch.where(
+        denom > 0,
+        torch.log(denom) + safe_lse_max,
+        torch.full_like(safe_lse_max, float("-inf")),
+    )
+    return out, lse
+
+
 def flash_attn_combine_native(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
@@ -316,10 +361,6 @@ def flash_attn_combine_native(
     verbose_build: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     backend = load_native_combine_backend(verbose=verbose_build)
-    if backend is None:
-        status = native_combine_backend_status()
-        raise RuntimeError(f"native combine backend unavailable: {status['error']}")
-
     split_valid_mask = build_combine_split_valid_mask(
         out_partial,
         lse_partial,
@@ -328,11 +369,18 @@ def flash_attn_combine_native(
         num_splits_dynamic_ptr=num_splits_dynamic_ptr,
         varlen_batch_idx=varlen_batch_idx,
     )
-    combined_out, combined_lse = backend.flash_attn_combine_forward(
-        out_partial,
-        lse_partial,
-        split_valid_mask,
-    )
+    if backend is None:
+        combined_out, combined_lse = _combine_split_attention_local(
+            out_partial,
+            lse_partial,
+            split_valid_mask=split_valid_mask,
+        )
+    else:
+        combined_out, combined_lse = backend.flash_attn_combine_forward(
+            out_partial,
+            lse_partial,
+            split_valid_mask,
+        )
     if out is None:
         target_dtype = out_dtype if out_dtype is not None else out_partial.dtype
         out = combined_out.to(dtype=target_dtype)

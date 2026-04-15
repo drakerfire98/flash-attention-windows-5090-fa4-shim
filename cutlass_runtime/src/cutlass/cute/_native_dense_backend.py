@@ -157,6 +157,7 @@ def flash_attn_dense_forward_native(
     causal: bool = False,
     window_size: tuple[int | None, int | None] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
+    extra_keep_mask: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     return_lse: bool = False,
     verbose_build: bool = False,
@@ -176,6 +177,9 @@ def flash_attn_dense_forward_native(
         if learnable_sink.ndim != 1:
             raise ValueError("learnable_sink must be a 1D tensor")
         sink_arg = learnable_sink.contiguous()
+    keep_mask_arg: torch.Tensor | None = None
+    if extra_keep_mask is not None:
+        keep_mask_arg = extra_keep_mask.to(device=q.device, dtype=torch.bool).contiguous()
     native_out, native_lse = backend.flash_attn_dense_forward(
         q,
         k,
@@ -186,6 +190,7 @@ def flash_attn_dense_forward_native(
         window_right,
         float(softcap),
         sink_arg,
+        keep_mask_arg,
     )
     call_parts: list[str] = []
     if softcap > 0.0:
@@ -194,6 +199,8 @@ def flash_attn_dense_forward_native(
         call_parts.append("learnable_sink")
     if window_size != (None, None):
         call_parts.append("window")
+    if extra_keep_mask is not None:
+        call_parts.append("extra_keep_mask")
     if not call_parts:
         call_parts.append("plain")
     _NATIVE_DENSE_LAST_CALL = "+".join(call_parts)

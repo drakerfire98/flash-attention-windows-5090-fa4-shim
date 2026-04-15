@@ -74,6 +74,11 @@ def _striped_mask(batch_idx, head_idx, q_idx, kv_idx):
     return (kv_idx == 0) | ((kv_idx <= q_idx) & (((q_idx + kv_idx + head_idx) % 3) != 1))
 
 
+def _dense_score_mod(scores, batch_idx, head_idx, q_idx, kv_idx):
+    del batch_idx
+    return scores + (head_idx.to(scores.dtype) * 0.02) + ((q_idx - kv_idx).to(scores.dtype) * 0.01)
+
+
 def _varlen_score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, seqlen_info):
     del batch_idx
     q_global = q_idx + seqlen_info.offset_q
@@ -228,6 +233,35 @@ def _run_dense_mask_mod(native_flash_attn_func, shim_mod):
         q, k, v, causal=False, return_lse=True, mask_mod=_striped_mask
     )
     _print_case_metrics("dense_mask_mod", native_out, ref_out, native_lse, ref_lse)
+
+
+def _run_dense_score_mod(iface, shim_mod):
+    torch.manual_seed(27)
+    q = torch.randn(1, 18, 2, 32, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 18, 2, 32, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 18, 2, 32, device="cuda", dtype=torch.bfloat16)
+    native_out, native_lse = iface._flash_attn_fwd(
+        q, k, v, causal=True, return_lse=True, score_mod=_dense_score_mod
+    )
+    ref_out, ref_lse = shim_mod._attention_forward_dense(
+        q,
+        k,
+        v,
+        softmax_scale=None,
+        causal=True,
+        window_size=(None, None),
+        learnable_sink=None,
+        softcap=0.0,
+        score_mod=_dense_score_mod,
+        mask_mod=None,
+        aux_tensors=None,
+        batch_start_index=0,
+        offset_q=0,
+        offset_k=0,
+        extra_keep_mask=None,
+        return_lse=True,
+    )
+    _print_case_metrics("dense_score_mod", native_out, ref_out, native_lse, ref_lse)
 
 
 def _run_dense_block_sparse(native_flash_attn_func, shim_mod):
@@ -560,6 +594,7 @@ def main() -> int:
         lambda: _run_dense_learnable_sink(flash_attn_func, shim_mod),
         lambda: _run_dense_window(flash_attn_func, shim_mod),
         lambda: _run_dense_mask_mod(flash_attn_func, shim_mod),
+        lambda: _run_dense_score_mod(iface, shim_mod),
         lambda: _run_dense_block_sparse(flash_attn_func, shim_mod),
         lambda: _run_varlen_softcap(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused(flash_attn_varlen_func, shim_mod),

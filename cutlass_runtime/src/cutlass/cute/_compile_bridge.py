@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import torch
@@ -20,38 +16,19 @@ from ._native_bwd_helpers_backend import (
 )
 from ._native_dense_backend import flash_attn_dense_forward_native, native_dense_backend_status
 from ._native_varlen_backend import flash_attn_varlen_forward_native, native_varlen_backend_status
+from ._runtime_local_core import (
+    attention_forward_dense_local,
+    attention_forward_varlen_local,
+    fill_block_sparse_tensors,
+    materialize_dense_keep_mask,
+    materialize_varlen_keep_mask,
+)
 
 
-_SHIM_MODULE: ModuleType | None = None
 _DLSE_BY_DQACCUM: dict[int, torch.Tensor | None] = {}
 _POSTPROCESS_RESULTS: dict[int, torch.Tensor] = {}
 _FWD_METADATA_BY_TENSOR_PTR: dict[int, dict[str, Any]] = {}
 _BWD_METADATA_BY_DQACCUM: dict[int, dict[str, Any]] = {}
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[4]
-
-
-def _load_windows_shim_module() -> ModuleType:
-    global _SHIM_MODULE
-    if _SHIM_MODULE is not None:
-        return _SHIM_MODULE
-
-    shim_init = _repo_root() / "shims" / "flash_attn" / "cute" / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        "native_probe_windows_flash_attn_cute_shim",
-        shim_init,
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load Windows shim module from {shim_init}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    _SHIM_MODULE = module
-    return module
-
-
 def _copy_tensor_like(dst: torch.Tensor | None, src: torch.Tensor | None) -> None:
     if dst is None or src is None:
         return
@@ -213,6 +190,315 @@ def _extract_softcap_score_mod_components(score_mod: Any) -> tuple[float | None,
     return softcap, nested_score_mod
 
 
+def _resolve_bridge_block_size(
+    kernel: Any,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_sparse_tensors: Any,
+) -> tuple[int, int] | None:
+    if block_sparse_tensors is None:
+        return None
+    kernel_q_subtile_factor = getattr(kernel, "q_subtile_factor", None)
+    q_subtile_factor = None if kernel_q_subtile_factor is None else int(kernel_q_subtile_factor or 1)
+    tile_m = int(getattr(kernel, "tile_m", getattr(kernel, "m_block_size", q.shape[1])))
+    tile_n = int(getattr(kernel, "tile_n", getattr(kernel, "n_block_size", k.shape[1])))
+    q_seqlen = int(q.shape[1]) if q.ndim >= 2 else int(q.shape[0])
+    return _resolve_block_size(
+        q_seqlen=q_seqlen,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        block_sparse_tensors=block_sparse_tensors,
+        q_subtile_factor=q_subtile_factor,
+    )
+
+
+def _run_forward_with_bridge_runtime(
+    *,
+    kernel: Any,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None,
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    seqused_q: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    page_table: torch.Tensor | None,
+    window_size: tuple[int | None, int | None],
+    learnable_sink: torch.Tensor | None,
+    softcap: float,
+    score_mod: Any,
+    mask_mod: Any,
+    aux_tensors: list[torch.Tensor] | None,
+    block_sparse_tensors: Any,
+    block_size_override: tuple[int, int] | None = None,
+    return_lse: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[int, int] | None]:
+    is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table))
+    causal = bool(getattr(kernel, "is_causal", False))
+    block_size = block_size_override or _resolve_bridge_block_size(kernel, q, k, block_sparse_tensors)
+
+    if score_mod is None and (mask_mod is not None or block_sparse_tensors is not None):
+        if is_varlen:
+            extra_keep_mask = materialize_varlen_keep_mask(
+                q,
+                k,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                page_table=page_table,
+                mask_mod=mask_mod,
+                aux_tensors=aux_tensors,
+                block_sparse_tensors=block_sparse_tensors,
+                block_size=block_size,
+            )
+            try:
+                return (
+                    *flash_attn_varlen_forward_native(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        seqused_q=seqused_q,
+                        seqused_k=seqused_k,
+                        page_table=page_table,
+                        softmax_scale=softmax_scale,
+                        causal=causal,
+                        window_size=window_size,
+                        learnable_sink=learnable_sink,
+                        extra_keep_mask=extra_keep_mask,
+                        softcap=softcap,
+                        return_lse=return_lse,
+                    ),
+                    block_size,
+                )
+            except Exception:
+                shim_out, shim_lse = attention_forward_varlen_local(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    page_table=page_table,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    learnable_sink=learnable_sink,
+                    softcap=softcap,
+                    score_mod=None,
+                    mask_mod=mask_mod,
+                    aux_tensors=aux_tensors,
+                    block_sparse_tensors=block_sparse_tensors,
+                    block_size=block_size,
+                    return_lse=return_lse,
+                )
+                return shim_out, shim_lse, block_size
+
+        extra_keep_mask = materialize_dense_keep_mask(
+            q,
+            k,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            batch_start_index=0,
+            offset_q=0,
+            offset_k=0,
+            block_sparse_tensors=block_sparse_tensors,
+            block_size=block_size,
+        )
+        try:
+            return (
+                *flash_attn_dense_forward_native(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    learnable_sink=learnable_sink,
+                    extra_keep_mask=extra_keep_mask,
+                    softcap=softcap,
+                    return_lse=return_lse,
+                ),
+                block_size,
+            )
+        except Exception:
+            shim_out, shim_lse = attention_forward_dense_local(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                softcap=softcap,
+                score_mod=None,
+                mask_mod=None,
+                aux_tensors=aux_tensors,
+                batch_start_index=0,
+                offset_q=0,
+                offset_k=0,
+                extra_keep_mask=extra_keep_mask,
+                return_lse=return_lse,
+            )
+            return shim_out, shim_lse, block_size
+
+    if _can_use_native_varlen_backend(
+        is_varlen=is_varlen,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+    ):
+        try:
+            return (
+                *flash_attn_varlen_forward_native(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    page_table=page_table,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    learnable_sink=learnable_sink,
+                    softcap=softcap,
+                    return_lse=return_lse,
+                ),
+                block_size,
+            )
+        except Exception:
+            shim_out, shim_lse = attention_forward_varlen_local(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                page_table=page_table,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                softcap=softcap,
+                score_mod=None,
+                mask_mod=None,
+                aux_tensors=None,
+                block_sparse_tensors=None,
+                block_size=None,
+                return_lse=return_lse,
+            )
+            return shim_out, shim_lse, block_size
+
+    if _can_use_native_dense_backend(
+        is_varlen=is_varlen,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        softcap=softcap,
+        learnable_sink=learnable_sink,
+        block_sparse_tensors=block_sparse_tensors,
+        window_size=window_size,
+    ):
+        try:
+            return (
+                *flash_attn_dense_forward_native(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    learnable_sink=learnable_sink,
+                    softcap=softcap,
+                    return_lse=return_lse,
+                ),
+                block_size,
+            )
+        except Exception:
+            shim_out, shim_lse = attention_forward_dense_local(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                softcap=softcap,
+                score_mod=None,
+                mask_mod=None,
+                aux_tensors=None,
+                batch_start_index=0,
+                offset_q=0,
+                offset_k=0,
+                extra_keep_mask=None,
+                return_lse=return_lse,
+            )
+            return shim_out, shim_lse, block_size
+
+    if is_varlen:
+        shim_out, shim_lse = attention_forward_varlen_local(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            block_sparse_tensors=block_sparse_tensors,
+            block_size=block_size,
+            return_lse=return_lse,
+        )
+        return shim_out, shim_lse, block_size
+
+    extra_keep_mask = None
+    if block_sparse_tensors is not None:
+        extra_keep_mask = materialize_dense_keep_mask(
+            q,
+            k,
+            mask_mod=None,
+            aux_tensors=None,
+            batch_start_index=0,
+            offset_q=0,
+            offset_k=0,
+            block_sparse_tensors=block_sparse_tensors,
+            block_size=block_size,
+        )
+    shim_out, shim_lse = attention_forward_dense_local(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        batch_start_index=0,
+        offset_q=0,
+        offset_k=0,
+        extra_keep_mask=extra_keep_mask,
+        return_lse=return_lse,
+    )
+    return shim_out, shim_lse, block_size
+
+
 def compat_replay_varlen_backward(
     *,
     q: torch.Tensor,
@@ -237,58 +523,31 @@ def compat_replay_varlen_backward(
     block_size: tuple[int, int] | None = None,
     return_lse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    shim = _load_windows_shim_module()
     with torch.enable_grad():
         q_req = q.detach().clone().requires_grad_(True)
         k_req = k.detach().clone().requires_grad_(True)
         v_req = v.detach().clone().requires_grad_(True)
-        if block_sparse_tensors is not None:
-            if block_size is None:
-                raise ValueError("block_size is required when replaying varlen block-sparse backward")
-            mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = block_sparse_tensors
-            shim_out, shim_lse = shim._attention_forward_varlen_block_sparse(
-                q_req,
-                k_req,
-                v_req,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                page_table=page_table,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                learnable_sink=learnable_sink,
-                softcap=0.0 if softcap is None else float(softcap),
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                full_block_cnt=full_block_cnt,
-                full_block_idx=full_block_idx,
-                mask_block_cnt=mask_block_cnt,
-                mask_block_idx=mask_block_idx,
-                block_size=block_size,
-                aux_tensors=aux_tensors,
-                return_lse=return_lse,
-            )
-        else:
-            shim_out, shim_lse = shim.flash_attn_varlen_func(
-                q_req,
-                k_req,
-                v_req,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                page_table=page_table,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                learnable_sink=learnable_sink,
-                softcap=0.0 if softcap is None else float(softcap),
-                score_mod=score_mod,
-                aux_tensors=aux_tensors,
-                return_lse=return_lse,
-            )
+        shim_out, shim_lse = attention_forward_varlen_local(
+            q_req,
+            k_req,
+            v_req,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=0.0 if softcap is None else float(softcap),
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            block_sparse_tensors=block_sparse_tensors,
+            block_size=block_size,
+            return_lse=return_lse,
+        )
 
         outputs: list[torch.Tensor] = [shim_out]
         grad_outputs: list[torch.Tensor] = [
@@ -345,191 +604,30 @@ class NativeProbeForwardBridge(JitCompiledFunction):
         block_sparse_tensors: Any,
         aux_tensors: list[torch.Tensor] | None,
     ) -> None:
-        shim = _load_windows_shim_module()
         window_size = _window_tuple(window_size_left, window_size_right)
-        common = dict(
-            softmax_scale=softmax_scale,
-            causal=bool(getattr(self.kernel, "is_causal", False)),
-            window_size=window_size,
-            learnable_sink=learnable_sink,
-            return_lse=lse is not None,
-        )
-        is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table))
         score_mod = getattr(self.kernel, "score_mod", None)
         mask_mod = getattr(self.kernel, "mask_mod", None)
         softcap, score_mod = _extract_softcap_score_mod_components(score_mod)
-        if _can_use_native_varlen_backend(
-            is_varlen=is_varlen,
-            score_mod=score_mod,
-            mask_mod=mask_mod,
-            block_sparse_tensors=block_sparse_tensors,
-        ):
-            block_size = None
-            try:
-                shim_out, shim_lse = flash_attn_varlen_forward_native(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    seqused_q=seqused_q,
-                    seqused_k=seqused_k,
-                    page_table=page_table,
-                    softmax_scale=softmax_scale,
-                    causal=bool(getattr(self.kernel, "is_causal", False)),
-                    window_size=window_size,
-                    learnable_sink=learnable_sink,
-                    softcap=softcap or 0.0,
-                    return_lse=lse is not None,
-                )
-            except Exception:
-                shim_out, shim_lse = shim.flash_attn_varlen_func(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    seqused_q=seqused_q,
-                    seqused_k=seqused_k,
-                    page_table=page_table,
-                    score_mod=None,
-                    aux_tensors=None,
-                    softcap=softcap or 0.0,
-                    **common,
-                )
-        elif _can_use_native_dense_backend(
-            is_varlen=is_varlen,
-            score_mod=score_mod,
-            mask_mod=mask_mod,
-            softcap=softcap,
-            learnable_sink=learnable_sink,
-            block_sparse_tensors=block_sparse_tensors,
+        shim_out, shim_lse, block_size = _run_forward_with_bridge_runtime(
+            kernel=self.kernel,
+            q=q,
+            k=k,
+            v=v,
+            softmax_scale=softmax_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
             window_size=window_size,
-        ):
-            block_size = None
-            try:
-                shim_out, shim_lse = flash_attn_dense_forward_native(
-                    q,
-                    k,
-                    v,
-                    softmax_scale=softmax_scale,
-                    causal=bool(getattr(self.kernel, "is_causal", False)),
-                    window_size=window_size,
-                    learnable_sink=learnable_sink,
-                    softcap=softcap or 0.0,
-                    return_lse=lse is not None,
-                )
-            except Exception:
-                shim_out, shim_lse = shim.flash_attn_func(
-                    q,
-                    k,
-                    v,
-                    softcap=0.0,
-                    mask_mod=None,
-                    **common,
-                )
-        elif block_sparse_tensors is not None:
-            mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = block_sparse_tensors
-            kernel_q_subtile_factor = getattr(self.kernel, "q_subtile_factor", None)
-            q_subtile_factor = None if kernel_q_subtile_factor is None else int(kernel_q_subtile_factor or 1)
-            tile_m = int(getattr(self.kernel, "tile_m", getattr(self.kernel, "m_block_size", q.shape[1])))
-            tile_n = int(getattr(self.kernel, "tile_n", getattr(self.kernel, "n_block_size", k.shape[1])))
-            block_size = _resolve_block_size(
-                q_seqlen=int(q.shape[1]) if q.ndim >= 2 else int(q.shape[0]),
-                tile_m=tile_m,
-                tile_n=tile_n,
-                block_sparse_tensors=block_sparse_tensors,
-                q_subtile_factor=q_subtile_factor,
-            )
-            if is_varlen:
-                shim_out, shim_lse = shim._attention_forward_varlen_block_sparse(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    seqused_q=seqused_q,
-                    seqused_k=seqused_k,
-                    page_table=page_table,
-                    softmax_scale=softmax_scale,
-                    causal=bool(getattr(self.kernel, "is_causal", False)),
-                    window_size=window_size,
-                    learnable_sink=learnable_sink,
-                    softcap=softcap or 0.0,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    full_block_cnt=full_block_cnt,
-                    full_block_idx=full_block_idx,
-                    mask_block_cnt=mask_block_cnt,
-                    mask_block_idx=mask_block_idx,
-                    block_size=block_size,
-                    aux_tensors=aux_tensors,
-                    return_lse=lse is not None,
-                )
-            else:
-                shim_out, shim_lse = shim._attention_forward_block_sparse(
-                    q,
-                    k,
-                    v,
-                    softmax_scale=softmax_scale,
-                    causal=bool(getattr(self.kernel, "is_causal", False)),
-                    window_size=window_size,
-                    learnable_sink=learnable_sink,
-                    softcap=softcap or 0.0,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    full_block_cnt=full_block_cnt,
-                    full_block_idx=full_block_idx,
-                    mask_block_cnt=mask_block_cnt,
-                    mask_block_idx=mask_block_idx,
-                    block_size=block_size,
-                    aux_tensors=aux_tensors,
-                    batch_start_index=0,
-                    offset_q=0,
-                    offset_k=0,
-                    return_lse=lse is not None,
-                )
-        elif is_varlen:
-            block_size = None
-            shim_out, shim_lse = shim.flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                page_table=page_table,
-                score_mod=score_mod,
-                aux_tensors=aux_tensors,
-                softcap=softcap or 0.0,
-                **common,
-            )
-        elif score_mod is not None:
-            block_size = None
-            shim_out, shim_lse = shim._attention_forward_dense(
-                q,
-                k,
-                v,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                aux_tensors=aux_tensors,
-                batch_start_index=0,
-                offset_q=0,
-                offset_k=0,
-                softcap=softcap or 0.0,
-                **common,
-            )
-        else:
-            block_size = None
-            shim_out, shim_lse = shim.flash_attn_func(
-                q,
-                k,
-                v,
-                softcap=softcap or 0.0,
-                mask_mod=mask_mod,
-                **common,
-            )
+            learnable_sink=learnable_sink,
+            softcap=softcap or 0.0,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            block_sparse_tensors=block_sparse_tensors,
+            return_lse=lse is not None,
+        )
         _copy_tensor_like(out, shim_out)
         _copy_tensor_like(lse, shim_lse)
         _stash_forward_metadata(
@@ -648,7 +746,6 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
         block_sparse_tensors: Any,
     ) -> None:
         del lse_log2, dpsum, dq_semaphore, dk_semaphore, dv_semaphore
-        shim = _load_windows_shim_module()
         dlse = _DLSE_BY_DQACCUM.pop(dq_accum.data_ptr(), None)
         compat_metadata = _BWD_METADATA_BY_DQACCUM.pop(dq_accum.data_ptr(), {})
         kernel_score_mod = getattr(self.kernel, "score_mod", None)
@@ -665,13 +762,6 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
             k_req = k.detach().clone().requires_grad_(True)
             v_req = v.detach().clone().requires_grad_(True)
             window_size = _window_tuple(window_size_left, window_size_right)
-            common = dict(
-                softmax_scale=softmax_scale,
-                causal=bool(getattr(self.kernel, "is_causal", False)),
-                window_size=window_size,
-                return_lse=dlse is not None,
-            )
-            is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k))
             score_mod = kernel_score_mod or compat_metadata.get("score_mod")
             mask_mod = getattr(self.kernel, "mask_mod", None) or compat_metadata.get("mask_mod")
             learnable_sink = compat_metadata.get("learnable_sink")
@@ -686,171 +776,31 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                 raise NotImplementedError(
                     "Block-sparse native probe backward requires forward metadata from the bridged forward path"
                 )
-            if block_sparse_tensors is not None:
-                if compat_block_size is None:
-                    raise NotImplementedError(
-                        "Block-sparse native probe backward bridge is missing the original block size metadata"
-                    )
-                mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = block_sparse_tensors
-                if is_varlen:
-                    shim_out, shim_lse = shim._attention_forward_varlen_block_sparse(
-                        q_req,
-                        k_req,
-                        v_req,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_k=cu_seqlens_k,
-                        seqused_q=seqused_q,
-                        seqused_k=seqused_k,
-                        page_table=page_table,
-                        softmax_scale=softmax_scale,
-                        causal=bool(getattr(self.kernel, "is_causal", False)),
-                        window_size=window_size,
-                        learnable_sink=learnable_sink,
-                        softcap=softcap_value,
-                        score_mod=score_mod,
-                        mask_mod=mask_mod,
-                        full_block_cnt=full_block_cnt,
-                        full_block_idx=full_block_idx,
-                        mask_block_cnt=mask_block_cnt,
-                        mask_block_idx=mask_block_idx,
-                        block_size=compat_block_size,
-                        aux_tensors=aux_tensors,
-                        return_lse=dlse is not None,
-                    )
-                else:
-                    shim_out, shim_lse = shim._attention_forward_block_sparse(
-                        q_req,
-                        k_req,
-                        v_req,
-                        softmax_scale=softmax_scale,
-                        causal=bool(getattr(self.kernel, "is_causal", False)),
-                        window_size=window_size,
-                        learnable_sink=learnable_sink,
-                        softcap=softcap_value,
-                        score_mod=score_mod,
-                        mask_mod=mask_mod,
-                        full_block_cnt=full_block_cnt,
-                        full_block_idx=full_block_idx,
-                        mask_block_cnt=mask_block_cnt,
-                        mask_block_idx=mask_block_idx,
-                        block_size=compat_block_size,
-                        aux_tensors=aux_tensors,
-                        batch_start_index=0,
-                        offset_q=0,
-                        offset_k=0,
-                        return_lse=dlse is not None,
-                    )
-            elif _can_use_native_varlen_backend(
-                is_varlen=is_varlen,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                block_sparse_tensors=None,
-            ):
-                try:
-                    shim_out, shim_lse = flash_attn_varlen_forward_native(
-                        q_req,
-                        k_req,
-                        v_req,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_k=cu_seqlens_k,
-                        seqused_q=seqused_q,
-                        seqused_k=seqused_k,
-                        page_table=page_table,
-                        softmax_scale=softmax_scale,
-                        causal=bool(getattr(self.kernel, "is_causal", False)),
-                        window_size=window_size,
-                        learnable_sink=learnable_sink,
-                        softcap=softcap_value,
-                        return_lse=dlse is not None,
-                    )
-                except Exception:
-                    shim_out, shim_lse = shim.flash_attn_varlen_func(
-                        q_req,
-                        k_req,
-                        v_req,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_k=cu_seqlens_k,
-                        seqused_q=seqused_q,
-                        seqused_k=seqused_k,
-                        page_table=page_table,
-                        score_mod=None,
-                        aux_tensors=None,
-                        learnable_sink=learnable_sink,
-                        softcap=softcap_value,
-                        **common,
-                    )
-            elif _can_use_native_dense_backend(
-                is_varlen=is_varlen,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                softcap=softcap_value,
-                learnable_sink=learnable_sink,
-                block_sparse_tensors=None,
+            if block_sparse_tensors is not None and compat_block_size is None:
+                raise NotImplementedError(
+                    "Block-sparse native probe backward bridge is missing the original block size metadata"
+                )
+            shim_out, shim_lse, _ = _run_forward_with_bridge_runtime(
+                kernel=self.kernel,
+                q=q_req,
+                k=k_req,
+                v=v_req,
+                softmax_scale=softmax_scale,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                page_table=page_table,
                 window_size=window_size,
-            ):
-                try:
-                    shim_out, shim_lse = flash_attn_dense_forward_native(
-                        q_req,
-                        k_req,
-                        v_req,
-                        softmax_scale=softmax_scale,
-                        causal=bool(getattr(self.kernel, "is_causal", False)),
-                        window_size=window_size,
-                        learnable_sink=learnable_sink,
-                        softcap=softcap_value,
-                        return_lse=dlse is not None,
-                    )
-                except Exception:
-                    shim_out, shim_lse = shim.flash_attn_func(
-                        q_req,
-                        k_req,
-                        v_req,
-                        learnable_sink=None,
-                        softcap=0.0,
-                        mask_mod=None,
-                        **common,
-                    )
-            elif is_varlen:
-                shim_out, shim_lse = shim.flash_attn_varlen_func(
-                    q_req,
-                    k_req,
-                    v_req,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    seqused_q=seqused_q,
-                    seqused_k=seqused_k,
-                    page_table=page_table,
-                    score_mod=score_mod,
-                    aux_tensors=aux_tensors,
-                    learnable_sink=learnable_sink,
-                    softcap=softcap_value,
-                    **common,
-                )
-            elif score_mod is not None:
-                shim_out, shim_lse = shim._attention_forward_dense(
-                    q_req,
-                    k_req,
-                    v_req,
-                    learnable_sink=learnable_sink,
-                    softcap=softcap_value,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    aux_tensors=aux_tensors,
-                    batch_start_index=0,
-                    offset_q=0,
-                    offset_k=0,
-                    **common,
-                )
-            else:
-                shim_out, shim_lse = shim.flash_attn_func(
-                    q_req,
-                    k_req,
-                    v_req,
-                    learnable_sink=learnable_sink,
-                    softcap=softcap_value,
-                    mask_mod=mask_mod,
-                    **common,
-                )
+                learnable_sink=learnable_sink,
+                softcap=softcap_value,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                aux_tensors=aux_tensors,
+                block_sparse_tensors=block_sparse_tensors,
+                block_size_override=compat_block_size,
+                return_lse=dlse is not None,
+            )
             grad_outputs: list[torch.Tensor] = [dout]
             outputs: list[torch.Tensor] = [shim_out]
             if dlse is not None and shim_lse is not None:
@@ -892,29 +842,16 @@ class NativeCompiledForwardCombineBridge(JitCompiledFunction):
         semaphore_to_reset: torch.Tensor | None,
     ) -> None:
         del semaphore_to_reset
-        try:
-            shim_out, shim_lse = flash_attn_combine_native(
-                out_partial,
-                lse_partial,
-                out_dtype=out.dtype,
-                cu_seqlens=cu_seqlens,
-                seqused=seqused,
-                varlen_batch_idx=varlen_batch_idx,
-                num_splits_dynamic_ptr=num_splits_dynamic_ptr,
-                return_lse=lse is not None,
-            )
-        except Exception:
-            shim = _load_windows_shim_module()
-            shim_out, shim_lse = shim.flash_attn_combine(
-                out_partial,
-                lse_partial,
-                out_dtype=out.dtype,
-                cu_seqlens=cu_seqlens,
-                seqused=seqused,
-                varlen_batch_idx=varlen_batch_idx,
-                num_splits_dynamic_ptr=num_splits_dynamic_ptr,
-                return_lse=lse is not None,
-            )
+        shim_out, shim_lse = flash_attn_combine_native(
+            out_partial,
+            lse_partial,
+            out_dtype=out.dtype,
+            cu_seqlens=cu_seqlens,
+            seqused=seqused,
+            varlen_batch_idx=varlen_batch_idx,
+            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
+            return_lse=lse is not None,
+        )
         _copy_tensor_like(out, shim_out)
         _copy_tensor_like(lse, shim_lse)
 
@@ -936,14 +873,13 @@ class NativeProbeBlockSparsityBridge(JitCompiledFunction):
         mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors_torch
         device = mask_block_cnt.device
         batch_size, num_heads, _ = mask_block_cnt.shape
-        shim = _load_windows_shim_module()
-        shim._fill_block_sparse_tensors(
+        fill_block_sparse_tensors(
             tile_m=int(self.kernel.tile_mn[0]),
             tile_n=int(self.kernel.tile_mn[1]),
             batch_size=int(batch_size),
             num_heads=int(num_heads),
-            seqlen_q=shim._coerce_python_int(seqlen_q),
-            seqlen_k=shim._coerce_python_int(seqlen_k),
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
             mask_mod=self.kernel.mask_mod,
             aux_tensors=aux_tensors,
             device=device,
