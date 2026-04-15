@@ -22,12 +22,13 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/collect_env.py`: emits a JSON fingerprint of the local machine, Python env, and toolchain
 - `scripts/patch_torch_cpp_extension_windows.py`: patches the local torch env to emit a Windows-safe `nvcc` launcher
 - `scripts/patch_flash_attn_setup.py`: patches `setup.py` in the source tree for explicit `BUILD_TARGET` handling
+- `scripts/patch_flash_attn_sm120_backward.py`: patches the local upstream FA4 source tree so the SM120 backward path does not reference `dQ_single_wg` before assignment
 - `scripts/smoke_test_flash_attn.py`: import and CUDA execution smoke test
 - `scripts/test_fa4_windows_shim.py`: probes the repo-local FA4 import shim and can run a tiny CUDA forward smoke test
 - `scripts/validate_fa4_windows_shim.py`: broader validation matrix for the Windows FA4 shim
 - `scripts/probe_cutlass_runtime.py`: reports which CUTLASS runtime the native FA4 probe is actually using and why
 - `scripts/probe_native_fa4_import.py`: isolated native-path import probe using compatibility shims instead of the stable fallback
-- `scripts/probe_native_fa4_forward.py`: tiny native-path CUDA forward probe plus SDPA sanity check
+- `scripts/probe_native_fa4_forward.py`: native-path forward probe covering base dense attention, dense `softcap`, dense `mask_mod`, and varlen `softcap`
 - `scripts/probe_native_fa4_backward.py`: dense + varlen native-path backward parity probe against the stable Windows shim
 - `shims/`: repo-local compatibility shims used only for FA4 Windows probing
 - `native_probe_shims/`: isolated import/runtime scaffolding that pushes the native FA4 path farther without touching the stable fallback
@@ -65,6 +66,10 @@ Current status:
 - the native probe now also replaces recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls with bridge objects
 - the tiny native-path CUDA forward probe now reaches numerically sane dense output through that bridge, with close parity versus SDPA even when LSE is requested
 - the new native-path backward probe now reaches dense and varlen backward parity against the stable Windows shim with `0.0` output and grad diffs in the seeded checks
+- widened native-path modifier probes now show:
+  - dense `mask_mod` forward parity is exact against the stable Windows shim
+  - varlen `softcap` forward parity is exact against the stable Windows shim
+  - dense `softcap` still has a small but real residual mismatch on both forward and backward parity probes, so that path is not fully stabilized yet
 - the compiled cache entry for that path is now `NativeProbeForwardBridge`, not a dead placeholder
 - the CUTLASS runtime probe currently shows `nvidia-cutlass-dsl` metadata is installed, but no separate modern CUTLASS runtime package is importable on this Windows env, so the probe still falls back to the legacy editable CUTLASS tree plus compatibility shims
 

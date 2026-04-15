@@ -91,6 +91,34 @@ def _run_varlen(native_flash_attn_varlen_func, shim_mod):
     print(f"varlen_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
 
 
+def _run_dense_softcap(native_flash_attn_func, shim_mod):
+    torch.manual_seed(5)
+    q = torch.randn(1, 12, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 12, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 12, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    native_out, native_lse = native_flash_attn_func(
+        q, k, v, causal=True, return_lse=True, softcap=10.0
+    )
+    native_loss = native_out.float().sum() + 0.05 * native_lse.float().sum()
+    native_loss.backward()
+    native_grads = (q.grad.detach().clone(), k.grad.detach().clone(), v.grad.detach().clone())
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    ref_out, ref_lse = shim_mod.flash_attn_func(
+        q_ref, k_ref, v_ref, causal=True, return_lse=True, softcap=10.0
+    )
+    ref_loss = ref_out.float().sum() + 0.05 * ref_lse.float().sum()
+    ref_loss.backward()
+    ref_grads = (q_ref.grad.detach().clone(), k_ref.grad.detach().clone(), v_ref.grad.detach().clone())
+
+    print("case=dense_softcap")
+    print(f"dense_softcap_out_max_diff={(native_out.float() - ref_out.float()).abs().max().item()}")
+    print(f"dense_softcap_grad_max_diff={_max_grad_diff(native_grads, ref_grads)}")
+    print(f"dense_softcap_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
+
+
 def main() -> int:
     repo_root = _repo_root()
     sys.path.insert(0, str(repo_root / "native_probe_shims"))
@@ -102,6 +130,7 @@ def main() -> int:
 
     shim_mod = _load_windows_shim_module()
     _run_dense(flash_attn_func, shim_mod)
+    _run_dense_softcap(flash_attn_func, shim_mod)
     _run_varlen(flash_attn_varlen_func, shim_mod)
     return 0
 

@@ -189,6 +189,7 @@ A second, isolated probe path now exists under:
 - `scripts/probe_native_fa4_import.py`
 - `scripts/probe_native_fa4_forward.py`
 - `scripts/probe_native_fa4_backward.py`
+- `scripts/patch_flash_attn_sm120_backward.py`
 
 This path is separate from the stable fallback shim under `shims/`. Its only job is to push the
 real native `flash_attn.cute` import/runtime chain forward far enough to reveal the next honest
@@ -210,6 +211,7 @@ Current probe result:
 - that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
 - recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
 - `scripts/probe_native_fa4_backward.py` now reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs in the current probe
+- `scripts/patch_flash_attn_sm120_backward.py` now reapplies the local SM120 `dQ_single_wg = False` fix idempotently instead of relying on memory
 
 This is more real than the earlier placeholder probe, but it is still not native CuTe codegen yet.
 
@@ -234,6 +236,27 @@ Observed backward probe output:
 - dense grad max diff vs stable shim: `0.0`
 - varlen output max diff vs stable shim: `0.0`
 - varlen grad max diff vs stable shim: `0.0`
+
+Observed widened modifier probe output:
+
+- dense `mask_mod` forward:
+  - output max diff vs stable shim: `0.0`
+  - LSE max diff vs stable shim: `0.0`
+- varlen `softcap` forward:
+  - output max diff vs stable shim: `0.0`
+  - LSE max diff vs stable shim: `0.0`
+- dense `softcap` forward:
+  - output max diff vs stable shim: `0.06640625`
+  - LSE max diff vs stable shim: about `0.08098`
+- dense `softcap` backward:
+  - output max diff vs stable shim: `0.0234375`
+  - grad max diff vs stable shim: `0.01953125`
+
+So the modifier surface is now split cleanly:
+
+- dense `mask_mod` is stable on the native probe bridge path
+- varlen `softcap` is stable on the native probe bridge path
+- dense `softcap` still has residual drift and remains an honest next debugging target
 
 That means the main forward path is no longer blocked by a dead placeholder for this recognized
 kernels. The next real missing piece is still a usable CuTe DSL compiler/runtime

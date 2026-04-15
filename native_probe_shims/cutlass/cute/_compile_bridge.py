@@ -73,6 +73,28 @@ def _window_tuple(window_left: int | None, window_right: int | None) -> tuple[in
     return (window_left, window_right)
 
 
+def _extract_softcap_from_generated_score_mod(score_mod: Any) -> float | None:
+    """Best-effort detection of FA4's internal softcap wrapper.
+
+    In the upstream forward path, a user-provided ``softcap`` is rewritten into
+    an internal ``score_mod`` closure via ``utils.create_softcap_scoremod``.
+    That generated callable is CuTe-flavored Python and is not executable in
+    our Windows bridge path, so we recover the original numeric softcap value
+    from the closure and route it through the stable shim's native ``softcap``
+    support instead.
+    """
+
+    if not callable(score_mod):
+        return None
+    if getattr(score_mod, "__name__", "") != "scoremod_premask_fn":
+        return None
+    for cell in getattr(score_mod, "__closure__", ()) or ():
+        value = getattr(cell, "cell_contents", None)
+        if isinstance(value, (int, float)) and value > 0:
+            return 1.0 / float(value)
+    return None
+
+
 class NativeProbeForwardBridge(JitCompiledFunction):
     def __init__(self, kernel: Any):
         self.kernel = kernel
@@ -115,6 +137,9 @@ class NativeProbeForwardBridge(JitCompiledFunction):
         is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table))
         score_mod = getattr(self.kernel, "score_mod", None)
         mask_mod = getattr(self.kernel, "mask_mod", None)
+        softcap = _extract_softcap_from_generated_score_mod(score_mod)
+        if softcap is not None:
+            score_mod = None
 
         if is_varlen:
             shim_out, shim_lse = shim.flash_attn_varlen_func(
@@ -128,6 +153,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                 page_table=page_table,
                 score_mod=score_mod,
                 aux_tensors=aux_tensors,
+                softcap=softcap or 0.0,
                 **common,
             )
         elif score_mod is not None:
@@ -141,7 +167,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                 batch_start_index=0,
                 offset_q=0,
                 offset_k=0,
-                softcap=0.0,
+                softcap=softcap or 0.0,
                 **common,
             )
         else:
@@ -149,6 +175,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                 q,
                 k,
                 v,
+                softcap=softcap or 0.0,
                 mask_mod=mask_mod,
                 **common,
             )
@@ -237,12 +264,13 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
         aux_tensors: list[torch.Tensor] | None,
         block_sparse_tensors: Any,
     ) -> None:
-        del lse_log2, dpsum, softcap, dq_semaphore, dk_semaphore, dv_semaphore
+        del lse_log2, dpsum, dq_semaphore, dk_semaphore, dv_semaphore
         if block_sparse_tensors is not None:
             raise NotImplementedError("Block-sparse native probe backward bridge is not implemented yet")
 
         shim = _load_windows_shim_module()
         dlse = _DLSE_BY_DQACCUM.pop(dq_accum.data_ptr(), None)
+        softcap_value = 0.0 if softcap is None else float(softcap)
 
         with torch.enable_grad():
             q_req = q.detach().clone().requires_grad_(True)
@@ -273,7 +301,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     score_mod=score_mod,
                     aux_tensors=aux_tensors,
                     learnable_sink=None,
-                    softcap=0.0,
+                    softcap=softcap_value,
                     **common,
                 )
             elif score_mod is not None:
@@ -282,7 +310,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     k_req,
                     v_req,
                     learnable_sink=None,
-                    softcap=0.0,
+                    softcap=softcap_value,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     aux_tensors=aux_tensors,
@@ -297,7 +325,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     k_req,
                     v_req,
                     learnable_sink=None,
-                    softcap=0.0,
+                    softcap=softcap_value,
                     mask_mod=mask_mod,
                     **common,
                 )
