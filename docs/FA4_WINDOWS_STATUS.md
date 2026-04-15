@@ -27,10 +27,12 @@ These installed in the isolated FA4 env:
 - `apache-tvm-ffi==0.1.10`
 - `torch-c-dlpack-ext==0.1.5`
 - `quack-kernels==0.3.10 --no-deps`
+- `cuda-python==13.2.0`
+- `cuda-bindings==13.2.0`
 - `nvidia-cutlass-dsl==4.4.2 --no-deps`
 - editable install of `flash-attn-4` from `third_party/flash-attention-for-windows/flash_attn/cute`
 
-## What Failed First
+## What Fails In A Clean Import
 
 The first real FA4 import still failed:
 
@@ -41,24 +43,58 @@ from flash_attn.cute import flash_attn_func
 Observed error:
 
 ```text
-ModuleNotFoundError: No module named 'cutlass'
+ImportError: cannot import name '__version__' from 'cuda' (unknown location)
 ```
 
-## Why It Failed
+That happens before the code even gets to `cutlass.cute`.
 
-`nvidia-cutlass-dsl==4.4.2` did install, but only as metadata.
+## Native Blockers We Confirmed
 
-`pip show -f nvidia-cutlass-dsl` reported only:
+There are now two confirmed native blockers on this Windows stack.
 
-- `nvidia_cutlass_dsl-4.4.2.dist-info/...`
+1. CUTLASS expects the older top-level CUDA Python API shape.
 
-It did **not** install an actual `cutlass` package tree, which is what `flash_attn.cute` imports immediately.
+The linked CUTLASS Python tree imports:
 
-The package metadata also still declares:
+```python
+from cuda import __version__
+from cuda import cuda, cudart, nvrtc
+```
 
-- `Requires: nvidia-cutlass-dsl-libs-base`
+But the installed Windows CUDA Python packages expose a namespace layout under:
 
-That dependency is the unresolved native Windows-side blocker in this environment.
+- `cuda.bindings.driver`
+- `cuda.bindings.runtime`
+- `cuda.bindings.nvrtc`
+
+So a clean `import cutlass` fails immediately on `from cuda import __version__`.
+
+2. The linked CUTLASS Python tree still does not contain `cutlass.cute`.
+
+The editable CUTLASS tree that becomes importable after a temporary compatibility patch lives at:
+
+- `third_party/flash-attention-for-windows/csrc/cutlass/python/cutlass`
+
+That tree exists, but it contains entries like:
+
+- `backend/`
+- `emit/`
+- `epilogue/`
+- `op/`
+- `shape.py`
+- `swizzle.py`
+
+and it does **not** contain:
+
+- `cutlass/cute/`
+
+So even after forcing a temporary in-memory CUDA compatibility shim that allows `import cutlass`, the next native failure is still:
+
+```text
+ModuleNotFoundError: No module named 'cutlass.cute'
+```
+
+There is also a separate `pycute` tree in the upstream CUTLASS source, but that is not the import path `flash_attn.cute` currently targets.
 
 ## Shim Progress
 
@@ -116,7 +152,14 @@ Additional validation coverage now passes in `scripts/validate_fa4_windows_shim.
 - varlen output / LSE reconstruction via chunked dense equivalence
 - varlen `softcap`, including backward parity
 - varlen `seqused_k` truncation, including backward parity
+- varlen `seqused_q` padded-Q support, with zero-filled padded outputs and `-inf` padded LSE rows
+- mixed varlen layout coverage for all four upstream-style combinations:
+  - packed Q + packed KV
+  - padded Q + padded KV
+  - packed Q + padded KV
+  - padded Q + packed KV
 - varlen `score_mod`, including global offset-aware `seqlen_info.offset_k`
+- mixed padded varlen `score_mod` coverage using logical global offsets on both Q and KV
 - varlen `score_mod` backward parity against the manual eager reference
 - varlen aux-only `score_mod(..., aux_tensors)` callable form
 - varlen `score_mod` also validated for `info`-named seqlen modifier signatures
@@ -131,18 +174,16 @@ Varlen note:
 
 So the shim is now good for a stable Windows fallback on the public FA4 entrypoints we implemented, but it is still **not** proof of a native CuTe/CUTLASS FA4 kernel path on Windows.
 
-## Upstream Support Signal
-
-NVIDIA's current CUTLASS DSL quick-start docs for the latest 4.4 line state that the supported target is Linux. That matches the behavior seen here: the FA4 Python package can be staged, but the actual CuTe DSL runtime layer needed for `cutlass.cute` is not landing as a usable Windows install in this environment.
-
 ## Practical Meaning
 
 At the moment this repo contains:
 
 - a verified FA2 Windows path
 - a partially assembled FA4 test env
-- a precise native FA4 import blocker
-- a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, and varlen `score_mod`
+- a precise native FA4 blocker chain:
+  - CUDA Python API-shape mismatch
+  - then missing `cutlass.cute` even after compatibility patching
+- a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, and the mixed packed/padded varlen layouts
 
 It does **not** yet contain a verified native Windows FA4 runtime path.
 
@@ -150,7 +191,7 @@ It does **not** yet contain a verified native Windows FA4 runtime path.
 
 The next promising route is one of:
 
-1. Find a real Windows build of `nvidia-cutlass-dsl-libs-base` that exposes the `cutlass` Python package.
-2. Build the missing CUTLASS DSL layer from source in a way that produces `cutlass.cute` for this Windows stack.
+1. Build or locate a Windows CUDA compatibility layer that exposes the old `from cuda import __version__, cuda, cudart, nvrtc` surface cleanly.
+2. Build or locate a CUTLASS Python package that actually provides `cutlass.cute` on Windows, not just the adjacent CUTLASS / pycute trees.
 3. Extend the shim only when more FA4 surface area is actually needed, keeping unsupported features explicit instead of silently approximated.
 4. Re-test native FA4 when upstream or community Windows packaging for the CUTLASS DSL layer matures.

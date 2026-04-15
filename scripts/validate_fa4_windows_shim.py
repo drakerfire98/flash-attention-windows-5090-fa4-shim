@@ -306,6 +306,131 @@ def _manual_varlen_seqused_k_ref(
     return torch.cat(outputs, dim=0), torch.cat(lse_chunks, dim=0)
 
 
+def _manual_varlen_layout_ref(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_q: torch.Tensor | None = None,
+    cu_k: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    causal: bool,
+    q_global_bias: torch.Tensor | None = None,
+    kv_global_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cu_q is not None:
+        batch = cu_q.numel() - 1
+        q_packed = True
+    else:
+        batch = q.shape[0]
+        q_packed = False
+    if cu_k is not None and cu_k.numel() - 1 != batch:
+        raise ValueError("q and k layouts must describe the same batch")
+    if cu_k is None and k.shape[0] != batch:
+        raise ValueError("q and k layouts must describe the same batch")
+
+    outputs = []
+    lse_chunks = []
+    q_running = 0
+    k_running = 0
+    q_full_len = q.shape[1] if not q_packed else None
+
+    for batch_idx in range(batch):
+        if cu_q is not None:
+            q_offset = int(cu_q[batch_idx].item())
+            q_used = int(cu_q[batch_idx + 1].item()) - q_offset
+            if seqused_q is not None:
+                q_used = min(q_used, int(seqused_q[batch_idx].item()))
+            q_chunk = q[q_offset : q_offset + q_used].unsqueeze(0)
+        else:
+            q_offset = q_running
+            q_used = int(seqused_q[batch_idx].item()) if seqused_q is not None else q.shape[1]
+            q_used = min(q_used, q.shape[1])
+            q_chunk = q[batch_idx : batch_idx + 1, :q_used]
+            q_running += q_used
+
+        if cu_k is not None:
+            k_offset = int(cu_k[batch_idx].item())
+            k_used = int(cu_k[batch_idx + 1].item()) - k_offset
+            if seqused_k is not None:
+                k_used = min(k_used, int(seqused_k[batch_idx].item()))
+            k_chunk = k[k_offset : k_offset + k_used].unsqueeze(0)
+            v_chunk = v[k_offset : k_offset + k_used].unsqueeze(0)
+        else:
+            k_offset = k_running
+            k_used = int(seqused_k[batch_idx].item()) if seqused_k is not None else k.shape[1]
+            k_used = min(k_used, k.shape[1])
+            k_chunk = k[batch_idx : batch_idx + 1, :k_used]
+            v_chunk = v[batch_idx : batch_idx + 1, :k_used]
+            k_running += k_used
+
+        if q_used == 0 or k_used == 0:
+            out_piece = q_chunk.new_zeros((q_used, q.shape[-2] if q_packed else q.shape[2], v.shape[-1]))
+            lse_piece = torch.full(
+                (q_used, q.shape[-2] if q_packed else q.shape[2]),
+                float("-inf"),
+                device=q.device,
+                dtype=torch.float32,
+            )
+        else:
+            qh = q_chunk.permute(0, 2, 1, 3)
+            kh = k_chunk.permute(0, 2, 1, 3)
+            vh = v_chunk.permute(0, 2, 1, 3)
+            if kh.shape[1] != qh.shape[1]:
+                repeat = qh.shape[1] // kh.shape[1]
+                kh = kh.repeat_interleave(repeat, dim=1)
+                vh = vh.repeat_interleave(repeat, dim=1)
+            scores = torch.matmul(qh.float(), kh.float().transpose(-1, -2)) * (q.shape[-1] ** -0.5)
+            if q_global_bias is not None:
+                scores = scores + q_global_bias[q_offset : q_offset + q_used].to(torch.float32).view(
+                    1, 1, q_used, 1
+                )
+            if kv_global_bias is not None:
+                scores = scores + kv_global_bias[k_offset : k_offset + k_used].to(torch.float32).view(
+                    1, 1, 1, k_used
+                )
+            if causal:
+                mask = torch.triu(
+                    torch.ones((q_used, k_used), device=q.device, dtype=torch.bool),
+                    diagonal=1 + k_used - q_used,
+                )
+                scores = scores.masked_fill(mask.view(1, 1, q_used, k_used), float("-inf"))
+            probs, lse = _manual_safe_probs_and_lse(scores)
+            out_piece = torch.matmul(probs, vh.float()).to(q.dtype).permute(0, 2, 1, 3).squeeze(0)
+            lse_piece = lse.permute(0, 2, 1).squeeze(0).contiguous()
+
+        if q_packed:
+            outputs.append(out_piece)
+            lse_chunks.append(lse_piece)
+            continue
+
+        pad_q = q_full_len - q_used
+        if pad_q > 0:
+            out_piece = torch.cat(
+                [out_piece, out_piece.new_zeros((pad_q, out_piece.shape[1], out_piece.shape[2]))],
+                dim=0,
+            )
+            lse_piece = torch.cat(
+                [
+                    lse_piece,
+                    torch.full(
+                        (pad_q, lse_piece.shape[1]),
+                        float("-inf"),
+                        device=lse_piece.device,
+                        dtype=lse_piece.dtype,
+                    ),
+                ],
+                dim=0,
+            )
+        outputs.append(out_piece)
+        lse_chunks.append(lse_piece)
+
+    if q_packed:
+        return torch.cat(outputs, dim=0), torch.cat(lse_chunks, dim=0)
+    return torch.stack(outputs, dim=0), torch.stack(lse_chunks, dim=0)
+
+
 def main() -> int:
     _add_shim_path()
     from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
@@ -553,6 +678,172 @@ def main() -> int:
     ref_out.float().sum().backward()
     _assert_grad_close(
         "varlen_seqused_k",
+        (q.grad, k.grad, v.grad),
+        (q_ref.grad, k_ref.grad, v_ref.grad),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    _manual_seed()
+    lengths_q = [4, 3]
+    physical_k = 6
+    used_k = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
+    heads = 2
+    dim = 16
+    q = torch.randn(sum(lengths_q), heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, physical_k, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(2, physical_k, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    cu_q = torch.tensor([0, lengths_q[0], sum(lengths_q)], device="cuda", dtype=torch.int32)
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_q,
+        seqused_k=used_k,
+        causal=True,
+        return_lse=True,
+    )
+    ref, ref_lse = _manual_varlen_layout_ref(
+        q,
+        k,
+        v,
+        cu_q=cu_q,
+        seqused_k=used_k,
+        causal=True,
+    )
+    _assert_close("mixed_q_packed_kv_padded_out", out, ref, atol=0.0, rtol=0.0)
+    _assert_close("mixed_q_packed_kv_padded_lse", lse, ref_lse, atol=0.0, rtol=0.0)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    out.float().sum().backward()
+    ref_out, _ = _manual_varlen_layout_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_q=cu_q,
+        seqused_k=used_k,
+        causal=True,
+    )
+    ref_out.float().sum().backward()
+    _assert_grad_close(
+        "mixed_q_packed_kv_padded",
+        (q.grad, k.grad, v.grad),
+        (q_ref.grad, k_ref.grad, v_ref.grad),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    _manual_seed()
+    physical_q = 6
+    lengths_k = [5, 4]
+    used_q = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
+    heads = 2
+    dim = 16
+    q = torch.randn(2, physical_q, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(sum(lengths_k), heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(sum(lengths_k), heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    cu_k = torch.tensor([0, lengths_k[0], sum(lengths_k)], device="cuda", dtype=torch.int32)
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_k=cu_k,
+        seqused_q=used_q,
+        causal=True,
+        return_lse=True,
+    )
+    ref, ref_lse = _manual_varlen_layout_ref(
+        q,
+        k,
+        v,
+        cu_k=cu_k,
+        seqused_q=used_q,
+        causal=True,
+    )
+    _assert_close("mixed_q_padded_kv_packed_out", out, ref, atol=0.0, rtol=0.0)
+    _assert_close("mixed_q_padded_kv_packed_lse", lse, ref_lse, atol=0.0, rtol=0.0)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    out.float().sum().backward()
+    ref_out, _ = _manual_varlen_layout_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_k=cu_k,
+        seqused_q=used_q,
+        causal=True,
+    )
+    ref_out.float().sum().backward()
+    _assert_grad_close(
+        "mixed_q_padded_kv_packed",
+        (q.grad, k.grad, v.grad),
+        (q_ref.grad, k_ref.grad, v_ref.grad),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    _manual_seed()
+    used_q = torch.tensor([3, 4], device="cuda", dtype=torch.int32)
+    used_k = torch.tensor([2, 5], device="cuda", dtype=torch.int32)
+    physical_q = 5
+    physical_k = 6
+    heads = 2
+    dim = 8
+    q = torch.randn(2, physical_q, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, physical_k, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(2, physical_k, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    q_bias = torch.linspace(-0.3, 0.4, steps=int(used_q.sum().item()), device="cuda", dtype=torch.float32)
+    kv_bias = torch.linspace(-0.2, 0.5, steps=int(used_k.sum().item()), device="cuda", dtype=torch.float32)
+
+    def mixed_info_score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, info):
+        del batch_idx, head_idx
+        return (
+            scores
+            + q_bias[q_idx + info.offset_q].to(torch.float32)
+            + kv_bias[kv_idx + info.offset_k].to(torch.float32)
+        )
+
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        seqused_q=used_q,
+        seqused_k=used_k,
+        causal=True,
+        score_mod=mixed_info_score_mod,
+        return_lse=True,
+    )
+    ref, ref_lse = _manual_varlen_layout_ref(
+        q,
+        k,
+        v,
+        seqused_q=used_q,
+        seqused_k=used_k,
+        causal=True,
+        q_global_bias=q_bias,
+        kv_global_bias=kv_bias,
+    )
+    _assert_close("mixed_seqused_qk_score_mod_out", out, ref, atol=0.0, rtol=0.0)
+    _assert_close("mixed_seqused_qk_score_mod_lse", lse, ref_lse, atol=0.0, rtol=0.0)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    out.float().sum().backward()
+    ref_out, _ = _manual_varlen_layout_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        seqused_q=used_q,
+        seqused_k=used_k,
+        causal=True,
+        q_global_bias=q_bias,
+        kv_global_bias=kv_bias,
+    )
+    ref_out.float().sum().backward()
+    _assert_grad_close(
+        "mixed_seqused_qk_score_mod",
         (q.grad, k.grad, v.grad),
         (q_ref.grad, k_ref.grad, v_ref.grad),
         atol=0.0,

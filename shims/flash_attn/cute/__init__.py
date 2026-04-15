@@ -25,6 +25,15 @@ class _SeqLenInfo:
     seqlen_k: int
 
 
+@dataclass(frozen=True)
+class _VarlenLayout:
+    packed: bool
+    batch: int
+    logical_starts: tuple[int, ...]
+    used_lengths: tuple[int, ...]
+    padded_length: Optional[int] = None
+
+
 def _normalize_window_size(
     window_size: Tuple[Optional[int], Optional[int]],
 ) -> Tuple[Optional[int], Optional[int]]:
@@ -88,6 +97,105 @@ def _make_seqlen_info(
         seqlen_q=int(seqlen_q),
         seqlen_k=int(seqlen_k),
     )
+
+
+def _build_varlen_layout(
+    tensor: torch.Tensor,
+    *,
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    name: str,
+) -> _VarlenLayout:
+    if cu_seqlens is not None:
+        if cu_seqlens.ndim != 1:
+            raise ValueError(f"{name} cu_seqlens must be 1D")
+        if tensor.ndim != 3:
+            raise ValueError(
+                f"varlen flash_attn_varlen_func expects packed {name} shaped (total, heads, dim) "
+                "when cu_seqlens are provided"
+            )
+        batch = cu_seqlens.numel() - 1
+        if batch < 0:
+            raise ValueError(f"{name} cu_seqlens must have at least one element")
+        if seqused is not None:
+            if seqused.ndim != 1 or seqused.numel() != batch:
+                raise ValueError(f"{name} seqused must be 1D with one length per batch item")
+        logical_starts = []
+        used_lengths = []
+        for batch_idx in range(batch):
+            start = int(cu_seqlens[batch_idx].item())
+            end = int(cu_seqlens[batch_idx + 1].item())
+            if end < start:
+                raise ValueError(f"{name} cu_seqlens must be nondecreasing")
+            used = end - start
+            if seqused is not None:
+                used = min(used, max(0, int(seqused[batch_idx].item())))
+            logical_starts.append(start)
+            used_lengths.append(used)
+        return _VarlenLayout(
+            packed=True,
+            batch=batch,
+            logical_starts=tuple(logical_starts),
+            used_lengths=tuple(used_lengths),
+        )
+
+    if tensor.ndim != 4:
+        raise ValueError(
+            f"varlen flash_attn_varlen_func expects padded {name} shaped (batch, seqlen, heads, dim) "
+            "when cu_seqlens are not provided"
+        )
+    batch = tensor.shape[0]
+    padded_length = tensor.shape[1]
+    if seqused is not None:
+        if seqused.ndim != 1 or seqused.numel() != batch:
+            raise ValueError(f"{name} seqused must be 1D with one length per batch item")
+        used_lengths = tuple(
+            min(padded_length, max(0, int(seqused[batch_idx].item()))) for batch_idx in range(batch)
+        )
+    else:
+        used_lengths = tuple([padded_length] * batch)
+    logical_starts = []
+    running = 0
+    for used in used_lengths:
+        logical_starts.append(running)
+        running += used
+    return _VarlenLayout(
+        packed=False,
+        batch=batch,
+        logical_starts=tuple(logical_starts),
+        used_lengths=tuple(used_lengths),
+        padded_length=padded_length,
+    )
+
+
+def _slice_varlen_batch(
+    tensor: torch.Tensor,
+    layout: _VarlenLayout,
+    batch_idx: int,
+) -> torch.Tensor:
+    used = layout.used_lengths[batch_idx]
+    if layout.packed:
+        start = layout.logical_starts[batch_idx]
+        return tensor[start : start + used].unsqueeze(0)
+    return tensor[batch_idx : batch_idx + 1, :used]
+
+
+def _zero_attention_chunk(
+    q_chunk: torch.Tensor,
+    v_chunk: torch.Tensor,
+    *,
+    return_lse: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    out = q_chunk.new_zeros((1, q_chunk.shape[1], q_chunk.shape[2], v_chunk.shape[-1]))
+    lse = None
+    if return_lse:
+        lse = torch.full(
+            (1, q_chunk.shape[1], q_chunk.shape[2]),
+            float("-inf"),
+            device=q_chunk.device,
+            dtype=torch.float32,
+        )
+    return out, lse
 
 
 def _resolve_mod_signature(mod: Callable, score_first: bool) -> str:
@@ -480,8 +588,6 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
 ):
     del deterministic, num_splits, pack_gqa, max_seqlen_q, max_seqlen_k
-    if cu_seqlens_q is None or cu_seqlens_k is None:
-        raise ValueError("cu_seqlens_q and cu_seqlens_k are required for varlen shim")
     if page_table is not None:
         raise NotImplementedError("paged KV is not supported by the Windows shim")
     _check_supported_common(
@@ -491,51 +597,82 @@ def flash_attn_varlen_func(
         score_mod=score_mod,
     )
 
-    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-        raise ValueError("varlen flash_attn_varlen_func expects q, k, v shaped (total, heads, dim)")
+    q_layout = _build_varlen_layout(q, cu_seqlens=cu_seqlens_q, seqused=seqused_q, name="q")
+    k_layout = _build_varlen_layout(k, cu_seqlens=cu_seqlens_k, seqused=seqused_k, name="k")
+    v_layout = _build_varlen_layout(v, cu_seqlens=cu_seqlens_k, seqused=seqused_k, name="v")
+    if k_layout != v_layout:
+        raise ValueError("k and v must use the same packed/padded layout and effective sequence lengths")
+    if q_layout.batch != k_layout.batch:
+        raise ValueError("q and kv must describe the same batch size")
 
-    batch = cu_seqlens_q.numel() - 1
     outputs = []
     lse_chunks = []
 
-    for batch_idx in range(batch):
-        q_start = int(cu_seqlens_q[batch_idx].item())
-        q_end = int(cu_seqlens_q[batch_idx + 1].item())
-        k_start = int(cu_seqlens_k[batch_idx].item())
-        k_end = int(cu_seqlens_k[batch_idx + 1].item())
+    for batch_idx in range(q_layout.batch):
+        q_chunk = _slice_varlen_batch(q, q_layout, batch_idx)
+        k_chunk = _slice_varlen_batch(k, k_layout, batch_idx)
+        v_chunk = _slice_varlen_batch(v, v_layout, batch_idx)
+        q_used = q_layout.used_lengths[batch_idx]
+        k_used = k_layout.used_lengths[batch_idx]
 
-        if seqused_q is not None:
-            q_end = min(q_end, q_start + int(seqused_q[batch_idx].item()))
-        if seqused_k is not None:
-            k_end = min(k_end, k_start + int(seqused_k[batch_idx].item()))
+        if q_used == 0 or k_used == 0:
+            out_chunk, lse_chunk = _zero_attention_chunk(q_chunk, v_chunk, return_lse=return_lse)
+        else:
+            out_chunk, lse_chunk = _attention_forward_dense(
+                q_chunk,
+                k_chunk,
+                v_chunk,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                softcap=softcap,
+                score_mod=score_mod,
+                mask_mod=None,
+                aux_tensors=aux_tensors,
+                batch_start_index=batch_idx,
+                offset_q=q_layout.logical_starts[batch_idx],
+                offset_k=k_layout.logical_starts[batch_idx],
+                return_lse=return_lse,
+            )
 
-        q_chunk = q[q_start:q_end].unsqueeze(0)
-        k_chunk = k[k_start:k_end].unsqueeze(0)
-        v_chunk = v[k_start:k_end].unsqueeze(0)
+        out_piece = out_chunk.squeeze(0)
+        lse_piece = lse_chunk.squeeze(0) if return_lse else None
+        if q_layout.packed:
+            outputs.append(out_piece)
+            if return_lse:
+                lse_chunks.append(lse_piece)
+            continue
 
-        out_chunk, lse_chunk = _attention_forward_dense(
-            q_chunk,
-            k_chunk,
-            v_chunk,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            learnable_sink=learnable_sink,
-            softcap=softcap,
-            score_mod=score_mod,
-            mask_mod=None,
-            aux_tensors=aux_tensors,
-            batch_start_index=batch_idx,
-            offset_q=q_start,
-            offset_k=k_start,
-            return_lse=return_lse,
-        )
-        outputs.append(out_chunk.squeeze(0))
+        pad_q = q_layout.padded_length - q_used
+        if pad_q > 0:
+            out_piece = torch.cat(
+                [out_piece, out_piece.new_zeros((pad_q, out_piece.shape[1], out_piece.shape[2]))],
+                dim=0,
+            )
+            if return_lse:
+                lse_piece = torch.cat(
+                    [
+                        lse_piece,
+                        torch.full(
+                            (pad_q, lse_piece.shape[1]),
+                            float("-inf"),
+                            device=lse_piece.device,
+                            dtype=lse_piece.dtype,
+                        ),
+                    ],
+                    dim=0,
+                )
+        outputs.append(out_piece)
         if return_lse:
-            lse_chunks.append(lse_chunk.squeeze(0))
+            lse_chunks.append(lse_piece)
 
-    out = torch.cat(outputs, dim=0) if outputs else q.new_empty((0, q.shape[1], q.shape[2]))
-    lse = torch.cat(lse_chunks, dim=0) if return_lse and lse_chunks else None
+    if q_layout.packed:
+        out = torch.cat(outputs, dim=0) if outputs else q.new_empty((0, q.shape[1], v.shape[-1]))
+        lse = torch.cat(lse_chunks, dim=0) if return_lse and lse_chunks else None
+    else:
+        out = torch.stack(outputs, dim=0)
+        lse = torch.stack(lse_chunks, dim=0) if return_lse else None
     return out, lse
 
 

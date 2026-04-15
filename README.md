@@ -51,10 +51,11 @@ Current status:
 - varlen validation also covers the aux-only `score_mod(..., aux_tensors)` callable form
 - validation now also covers dense and varlen `softcap`
 - validation now also covers varlen `seqused_k` truncation
+- validation now also covers varlen `seqused_q` plus the mixed packed/padded layout paths
 - validation now also covers `info`-named seqlen modifier signatures in addition to `seqlen_info`
 - the shim passes the broader validation matrix in `scripts/validate_fa4_windows_shim.py`
 
-The root native blocker is still that `nvidia-cutlass-dsl==4.4.2` installs only metadata in this environment and still requires `nvidia-cutlass-dsl-libs-base`, which does not currently resolve to a usable Windows package here. The current stable path is therefore a Windows compatibility shim layered on top of that gap, not a native FA4 kernel path.
+The root native blocker is now pinned down more precisely than just "missing wheels". In `.venv_fa4`, the editable CUTLASS Python tree is present, but a plain import still fails because CUTLASS expects the older top-level CUDA Python API shape (`from cuda import __version__, cuda, cudart, nvrtc`) while the installed `cuda-python==13.2.0` exposes modules under `cuda.bindings.*`. Even after an in-memory compatibility patch makes `import cutlass` succeed, the linked tree still does not contain `cutlass.cute`, which is the module `flash_attn.cute` needs. The current stable path is therefore a Windows compatibility shim, not a native FA4 kernel path.
 
 See `docs/FA4_WINDOWS_STATUS.md` for the exact attempted install path and blocker.
 
