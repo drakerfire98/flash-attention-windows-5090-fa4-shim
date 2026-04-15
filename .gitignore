@@ -214,3 +214,4 @@ wheelhouse/
 third_party/flash-attention-for-windows/
 .tmp_env_bootstrap/
 .tmp_pip_runtime/
+.torch_extensions/

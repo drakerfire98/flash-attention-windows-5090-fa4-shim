@@ -150,6 +150,7 @@ def main() -> int:
 
     import flash_attn.cute.interface as iface
     import cutlass
+    from cutlass.cute._native_backend import native_combine_backend_status
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the native combine probe")
@@ -159,6 +160,7 @@ def main() -> int:
     print(f"loaded_interface={getattr(iface, '__file__', '<unknown>')}")
     print(f"cutlass_probe_mode={getattr(cutlass, 'NATIVE_PROBE_MODE', '<unknown>')}")
     print(f"cutlass_probe_reason={getattr(cutlass, 'NATIVE_PROBE_REASON', '<unknown>')}")
+    print(f"native_combine_backend_pre={native_combine_backend_status()}")
 
     for runner in (
         lambda: _run_batched(iface, shim_mod),
@@ -177,6 +179,7 @@ def main() -> int:
         print(f"compiled_types={compiled_types}")
         if compiled_values:
             print(f"compiled_repr_sample={repr(compiled_values[0])}")
+        print(f"native_combine_backend_post={native_combine_backend_status()}")
 
     return 0
 

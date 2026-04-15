@@ -110,14 +110,15 @@
 
 - The environment is still not a true Windows-native CuTe/CUTLASS DSL runtime.
 - The root package, the top-level `cutlass.cute` package, the heavy compile bridge, the `base_dsl.runtime.cuda` loader path, and the currently imported `cutlass_dsl` / `pipeline` / `utils` / `_mlir` surfaces are now local.
-- The remaining blocker is no longer active `cutlass.*` leakage from `native_probe_shims`; it is that `cutlass.cute.compile` still resolves recognized kernels to repo-local bridge objects instead of a true compiled Windows CuTe/CUTLASS DSL backend.
+- The remaining blocker is no longer active `cutlass.*` leakage from `native_probe_shims`; the forward-combine family now builds through a real compiled Windows extension, but the rest of `cutlass.cute.compile` still resolves recognized kernels to repo-local bridge objects instead of a true compiled Windows CuTe/CUTLASS DSL backend.
 - The current probe mode is now `runtime-local-core`, which is better than `runtime-wrapper+legacy-core` but still not a true native compiler/runtime.
 - The active `flash_attn.cute.interface` surface is now repo-local under `flash_attn_runtime/src/flash_attn/cute/interface.py`; the upstream clone is now a refresh source, not a live runtime dependency.
 - The public backward path now accepts dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod` through the replay bridge, and the native backward probe reports exact parity for those cases.
+- The forward-combine probe now reports `NativeCompiledForwardCombineBridge` with `backend=compiled`, backed by `fa4_windows_native_combine_ext.cp313-win_amd64.pyd`, and all tested batched/varlen/dynamic combine cases remain exact.
 
 ### Next sensible targets
 
 - Keep `scripts/sync_flash_attn_runtime_overlay.py` and `scripts/patch_flash_attn_sm120_backward.py` as the single source of truth for overlay refreshes after each upstream sync.
 - Extend validator/probe coverage only when new FA4 surface area is actually added.
 - Keep pushing the real blocker:
-  - replacing `runtime-local-core` plus repo-local bridge objects with a genuine Windows CuTe/CUTLASS DSL runtime/compiler path.
+  - replacing more of `runtime-local-core` with genuine compiled Windows backend slices instead of repo-local bridge objects.

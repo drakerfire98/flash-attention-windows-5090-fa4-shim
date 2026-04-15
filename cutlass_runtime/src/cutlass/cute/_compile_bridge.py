@@ -12,6 +12,7 @@ import torch
 
 from _probe_helpers import ProbePlaceholder
 from cutlass.cutlass_dsl import JitCompiledFunction
+from ._native_backend import flash_attn_combine_native, native_combine_backend_status
 
 
 _SHIM_MODULE: ModuleType | None = None
@@ -665,9 +666,11 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
             _copy_tensor_like(dv_or_accum, dv_grad.detach())
 
 
-class NativeProbeForwardCombineBridge(JitCompiledFunction):
+class NativeCompiledForwardCombineBridge(JitCompiledFunction):
     def __repr__(self) -> str:
-        return "<NativeProbeForwardCombineBridge>"
+        status = native_combine_backend_status()
+        backend = "compiled" if status.get("loaded") else "fallback"
+        return f"<NativeCompiledForwardCombineBridge backend={backend}>"
 
     def __call__(
         self,
@@ -682,17 +685,29 @@ class NativeProbeForwardCombineBridge(JitCompiledFunction):
         semaphore_to_reset: torch.Tensor | None,
     ) -> None:
         del semaphore_to_reset
-        shim = _load_windows_shim_module()
-        shim_out, shim_lse = shim.flash_attn_combine(
-            out_partial,
-            lse_partial,
-            out_dtype=out.dtype,
-            cu_seqlens=cu_seqlens,
-            seqused=seqused,
-            varlen_batch_idx=varlen_batch_idx,
-            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
-            return_lse=lse is not None,
-        )
+        try:
+            shim_out, shim_lse = flash_attn_combine_native(
+                out_partial,
+                lse_partial,
+                out_dtype=out.dtype,
+                cu_seqlens=cu_seqlens,
+                seqused=seqused,
+                varlen_batch_idx=varlen_batch_idx,
+                num_splits_dynamic_ptr=num_splits_dynamic_ptr,
+                return_lse=lse is not None,
+            )
+        except Exception:
+            shim = _load_windows_shim_module()
+            shim_out, shim_lse = shim.flash_attn_combine(
+                out_partial,
+                lse_partial,
+                out_dtype=out.dtype,
+                cu_seqlens=cu_seqlens,
+                seqused=seqused,
+                varlen_batch_idx=varlen_batch_idx,
+                num_splits_dynamic_ptr=num_splits_dynamic_ptr,
+                return_lse=lse is not None,
+            )
         _copy_tensor_like(out, shim_out)
         _copy_tensor_like(lse, shim_lse)
 
@@ -753,7 +768,7 @@ def compile_dispatch(op: Any, *args, **kwargs):
     if op_name.startswith("FlashAttentionForwardSm"):
         return NativeProbeForwardBridge(op)
     if op_name == "FlashAttentionForwardCombine":
-        return NativeProbeForwardCombineBridge()
+        return NativeCompiledForwardCombineBridge()
     if op_name == "BlockSparsityKernel":
         return NativeProbeBlockSparsityBridge(op)
     if op_name == "FlashAttentionBackwardPreprocess":
