@@ -676,7 +676,75 @@ def flash_attn_varlen_func(
     return out, lse
 
 
+def _combine_split_attention(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if out_partial.ndim not in (4, 5):
+        raise ValueError("out_partial must have 4 or 5 dimensions")
+    if lse_partial.ndim != out_partial.ndim - 1:
+        raise ValueError("lse_partial rank must be exactly one less than out_partial rank")
+    if out_partial.shape[:-1] != lse_partial.shape:
+        raise ValueError("out_partial and lse_partial shapes are incompatible")
+    if out_partial.shape[0] == 0:
+        raise ValueError("out_partial must include at least one split")
+
+    lse_float = lse_partial.float()
+    valid = ~torch.isneginf(lse_float)
+    any_valid = valid.any(dim=0)
+    lse_max = torch.amax(lse_float, dim=0)
+    safe_lse_max = torch.where(any_valid, lse_max, torch.zeros_like(lse_max))
+
+    weights = torch.where(
+        valid,
+        torch.exp(lse_float - safe_lse_max.unsqueeze(0)),
+        torch.zeros_like(lse_float),
+    )
+    denom = weights.sum(dim=0)
+    numerator = (out_partial.float() * weights.unsqueeze(-1)).sum(dim=0)
+    out = torch.where(
+        denom.unsqueeze(-1) > 0,
+        numerator / denom.unsqueeze(-1),
+        torch.zeros_like(numerator),
+    )
+    lse = torch.where(
+        denom > 0,
+        torch.log(denom) + safe_lse_max,
+        torch.full_like(safe_lse_max, float("-inf")),
+    )
+    return out, lse
+
+
+def flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    varlen_batch_idx: Optional[torch.Tensor] = None,
+    return_lse: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    del cu_seqlens, seqused, varlen_batch_idx
+
+    combined_out, combined_lse = _combine_split_attention(out_partial, lse_partial)
+    if out is None:
+        target_dtype = out_dtype if out_dtype is not None else out_partial.dtype
+        out = combined_out.to(dtype=target_dtype)
+    else:
+        if out.shape != combined_out.shape:
+            raise ValueError(
+                f"out shape {tuple(out.shape)} does not match combined output shape {tuple(combined_out.shape)}"
+            )
+        out.copy_(combined_out.to(dtype=out.dtype))
+
+    if not return_lse:
+        return out, None
+    return out, combined_lse
+
+
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen_func",
+    "flash_attn_combine",
 ]

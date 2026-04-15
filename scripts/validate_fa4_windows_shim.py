@@ -122,6 +122,35 @@ def _manual_safe_probs_and_lse(scores: torch.Tensor) -> tuple[torch.Tensor, torc
     return probs, lse
 
 
+def _manual_combine_ref(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lse_float = lse_partial.float()
+    valid = ~torch.isneginf(lse_float)
+    any_valid = valid.any(dim=0)
+    lse_max = torch.amax(lse_float, dim=0)
+    safe_lse_max = torch.where(any_valid, lse_max, torch.zeros_like(lse_max))
+    weights = torch.where(
+        valid,
+        torch.exp(lse_float - safe_lse_max.unsqueeze(0)),
+        torch.zeros_like(lse_float),
+    )
+    denom = weights.sum(dim=0)
+    numerator = (out_partial.float() * weights.unsqueeze(-1)).sum(dim=0)
+    out = torch.where(
+        denom.unsqueeze(-1) > 0,
+        numerator / denom.unsqueeze(-1),
+        torch.zeros_like(numerator),
+    ).to(out_partial.dtype)
+    lse = torch.where(
+        denom > 0,
+        torch.log(denom) + safe_lse_max,
+        torch.full_like(safe_lse_max, float("-inf")),
+    )
+    return out, lse
+
+
 def _manual_mask_mod_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     qh = q.permute(0, 2, 1, 3)
     kh = k.permute(0, 2, 1, 3)
@@ -433,12 +462,28 @@ def _manual_varlen_layout_ref(
 
 def main() -> int:
     _add_shim_path()
-    from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.cute import flash_attn_combine, flash_attn_func, flash_attn_varlen_func
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this validation script")
 
     _manual_seed()
+
+    out_partial = torch.randn(3, 2, 4, 3, 8, device="cuda", dtype=torch.bfloat16)
+    lse_partial = torch.randn(3, 2, 4, 3, device="cuda", dtype=torch.float32)
+    lse_partial[2, 1, 3, :] = float("-inf")
+    out, lse = flash_attn_combine(out_partial, lse_partial, return_lse=True)
+    ref_out, ref_lse = _manual_combine_ref(out_partial, lse_partial)
+    _assert_close("combine_batched_out", out, ref_out, atol=0.0, rtol=0.0)
+    _assert_close("combine_batched_lse", lse, ref_lse, atol=0.0, rtol=0.0)
+
+    out_partial = torch.randn(4, 7, 2, 8, device="cuda", dtype=torch.bfloat16)
+    lse_partial = torch.randn(4, 7, 2, device="cuda", dtype=torch.float32)
+    lse_partial[:, 5, 1] = float("-inf")
+    out, lse = flash_attn_combine(out_partial, lse_partial, return_lse=True)
+    ref_out, ref_lse = _manual_combine_ref(out_partial, lse_partial)
+    _assert_close("combine_varlen_out", out, ref_out, atol=0.0, rtol=0.0)
+    _assert_close("combine_varlen_lse", lse, ref_lse, atol=0.0, rtol=0.0)
 
     q = torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)

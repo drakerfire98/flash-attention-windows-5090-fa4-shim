@@ -427,6 +427,42 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
             _copy_tensor_like(dv_or_accum, dv_grad.detach())
 
 
+class NativeProbeForwardCombineBridge(JitCompiledFunction):
+    def __repr__(self) -> str:
+        return "<NativeProbeForwardCombineBridge>"
+
+    def __call__(
+        self,
+        out_partial: torch.Tensor,
+        lse_partial: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+        seqused: torch.Tensor | None,
+        num_splits_dynamic_ptr: torch.Tensor | None,
+        varlen_batch_idx: torch.Tensor | None,
+        semaphore_to_reset: torch.Tensor | None,
+    ) -> None:
+        del semaphore_to_reset
+        if num_splits_dynamic_ptr is not None:
+            raise NotImplementedError(
+                "Native probe forward-combine bridge does not yet implement num_splits_dynamic_ptr"
+            )
+
+        shim = _load_windows_shim_module()
+        shim_out, shim_lse = shim.flash_attn_combine(
+            out_partial,
+            lse_partial,
+            out_dtype=out.dtype,
+            cu_seqlens=cu_seqlens,
+            seqused=seqused,
+            varlen_batch_idx=varlen_batch_idx,
+            return_lse=lse is not None,
+        )
+        _copy_tensor_like(out, shim_out)
+        _copy_tensor_like(lse, shim_lse)
+
+
 class NativeProbeUnsupportedBridge(JitCompiledFunction):
     def __init__(self, op: Any):
         self.op = op
@@ -447,6 +483,8 @@ def compile_dispatch(op: Any, *args, **kwargs):
     op_name = type(op).__name__
     if op_name.startswith("FlashAttentionForwardSm"):
         return NativeProbeForwardBridge(op)
+    if op_name == "FlashAttentionForwardCombine":
+        return NativeProbeForwardCombineBridge()
     if op_name == "FlashAttentionBackwardPreprocess":
         return NativeProbeBackwardPreprocessBridge()
     if op_name == "FlashAttentionBackwardPostprocess":
