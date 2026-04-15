@@ -27,7 +27,15 @@ class BaseDSL:
 
 
 class Arch:
-    pass
+    sm_80 = 80
+    sm_90 = 90
+    sm_90a = 90
+    sm_100 = 100
+    sm_103 = 103
+    sm_103f = 103
+    sm_110 = 110
+    sm_110f = 110
+    sm_120 = 120
 
 
 T = ProbePlaceholder("cutlass.cutlass_dsl.T")

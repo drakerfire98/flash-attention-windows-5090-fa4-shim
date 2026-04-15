@@ -188,6 +188,7 @@ A second, isolated probe path now exists under:
 - `scripts/probe_cutlass_runtime.py`
 - `scripts/probe_native_fa4_import.py`
 - `scripts/probe_native_fa4_forward.py`
+- `scripts/probe_native_fa4_backward.py`
 
 This path is separate from the stable fallback shim under `shims/`. Its only job is to push the
 real native `flash_attn.cute` import/runtime chain forward far enough to reveal the next honest
@@ -207,6 +208,8 @@ Current probe result:
 - `scripts/probe_native_fa4_forward.py` now reaches a tiny CUDA forward call through that native path
 - recognized FA4 forward-kernel `cute.compile(...)` calls now return a real `NativeProbeForwardBridge` object instead of a dead placeholder
 - that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
+- recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
+- `scripts/probe_native_fa4_backward.py` now reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs in the current probe
 
 This is more real than the earlier placeholder probe, but it is still not native CuTe codegen yet.
 
@@ -225,16 +228,28 @@ Observed probe output with `return_lse=True`:
 - CUTLASS probe mode: `legacy-editable-cutlass`
 - CUTLASS probe reason: `nvidia-cutlass-dsl` is installed, but no separate modern importable CUTLASS package files are available on this Windows env
 
+Observed backward probe output:
+
+- dense output max diff vs stable shim: `0.0`
+- dense grad max diff vs stable shim: `0.0`
+- varlen output max diff vs stable shim: `0.0`
+- varlen grad max diff vs stable shim: `0.0`
+
 That means the main forward path is no longer blocked by a dead placeholder for this recognized
-kernel family. The next real missing piece is still a usable CuTe DSL compiler/runtime
+kernels. The next real missing piece is still a usable CuTe DSL compiler/runtime
 implementation behind:
 
 - `cutlass.cute.compile`
 - related runtime / cubin load hooks
 
 Until that exists for this Windows stack, the native probe can import and traverse the FA4 code
-path and selectively bridge known forward kernels, but it still will not be a true native FA4
-kernel implementation.
+path and selectively bridge known forward and backward kernels, but it still will not be a true
+native FA4 kernel implementation.
+
+Checkpoint note:
+
+- the current backward checkpoint also relies on one local upstream source fix in `third_party/flash-attention-for-windows/flash_attn/cute/interface.py`
+- that fix initializes `dQ_single_wg = False` before the architecture branch so the SM120 backward path does not raise `UnboundLocalError`
 
 ## Practical Meaning
 
