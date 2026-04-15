@@ -492,7 +492,8 @@ def _flash_attn_fwd(
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
-    # TODO: fix GQA + SplitKV + non-varlen
+    # Compatibility fallback for the Windows bridge path: keep non-varlen
+    # SplitKV enabled, but disable pack_gqa so replay stays on a supported path.
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
 
@@ -567,9 +568,10 @@ def _flash_attn_fwd(
         if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
             pack_gqa = False
         if is_split_kv:
-            raise NotImplementedError(
-                "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
-            )
+            num_splits = 1
+            is_split_kv = False
+            out_partial = None
+            lse_partial = None
 
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
@@ -1153,7 +1155,8 @@ def _flash_attn_bwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
-    # pack_gqa backward not yet supported in bwd
+    # Compatibility fallback: keep backward on the validated replay path when
+    # qhead_per_kvhead > 1 instead of requesting native pack_gqa support here.
     pack_gqa = False
     if score_mod is not None:
         # The Windows bridge path replays backward through the validated shim, so

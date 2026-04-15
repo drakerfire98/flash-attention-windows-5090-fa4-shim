@@ -78,6 +78,7 @@ def main() -> int:
     import cutlass.cute as cute
     import cutlass.cute._compile_bridge as cute_compile_bridge
     from cutlass.cute._native_backend import native_combine_backend_status
+    from cutlass.cute._native_dense_backend import native_dense_backend_status
     import cutlass.base_dsl.runtime.cuda as runtime_cuda_module
     import flash_attn.cute as fa4
     import flash_attn.cute.interface as fa4_interface
@@ -105,6 +106,7 @@ def main() -> int:
     print(f"flash_attn_cute_file={getattr(fa4, '__file__', '<missing>')}")
     print(f"flash_attn_cute_interface_file={getattr(fa4_interface, '__file__', '<missing>')}")
     print(f"native_combine_backend={native_combine_backend_status()}")
+    print(f"native_dense_backend={native_dense_backend_status()}")
 
     runtime_cuda = getattr(getattr(getattr(cutlass, "base_dsl", None), "runtime", None), "cuda", None)
     load_cubin = getattr(runtime_cuda, "load_cubin_module_data", None)

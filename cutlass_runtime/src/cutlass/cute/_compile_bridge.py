@@ -13,6 +13,7 @@ import torch
 from _probe_helpers import ProbePlaceholder
 from cutlass.cutlass_dsl import JitCompiledFunction
 from ._native_backend import flash_attn_combine_native, native_combine_backend_status
+from ._native_dense_backend import flash_attn_dense_forward_native, native_dense_backend_status
 
 
 _SHIM_MODULE: ModuleType | None = None
@@ -74,6 +75,27 @@ def _convert_tensor_like(src: torch.Tensor | None, like: torch.Tensor | None) ->
 
 def _window_tuple(window_left: int | None, window_right: int | None) -> tuple[int | None, int | None]:
     return (window_left, window_right)
+
+
+def _can_use_native_dense_backend(
+    *,
+    is_varlen: bool,
+    score_mod: Any,
+    mask_mod: Any,
+    softcap: float | None,
+    learnable_sink: torch.Tensor | None,
+    block_sparse_tensors: Any,
+    window_size: tuple[int | None, int | None],
+) -> bool:
+    return (
+        not is_varlen
+        and score_mod is None
+        and mask_mod is None
+        and (softcap is None or float(softcap) == 0.0)
+        and learnable_sink is None
+        and block_sparse_tensors is None
+        and window_size == (None, None)
+    )
 
 
 def _tensor_ptr(tensor: torch.Tensor | None) -> int | None:
@@ -277,7 +299,9 @@ class NativeProbeForwardBridge(JitCompiledFunction):
         self.kernel_name = type(kernel).__name__
 
     def __repr__(self) -> str:
-        return f"<NativeProbeForwardBridge {self.kernel_name}>"
+        status = native_dense_backend_status()
+        backend = "compiled" if status.get("loaded") else "fallback"
+        return f"<NativeProbeForwardBridge {self.kernel_name} dense_backend={backend}>"
 
     def __call__(
         self,
@@ -299,10 +323,11 @@ class NativeProbeForwardBridge(JitCompiledFunction):
         aux_tensors: list[torch.Tensor] | None,
     ) -> None:
         shim = _load_windows_shim_module()
+        window_size = _window_tuple(window_size_left, window_size_right)
         common = dict(
             softmax_scale=softmax_scale,
             causal=bool(getattr(self.kernel, "is_causal", False)),
-            window_size=_window_tuple(window_size_left, window_size_right),
+            window_size=window_size,
             learnable_sink=learnable_sink,
             return_lse=lse is not None,
         )
@@ -310,7 +335,36 @@ class NativeProbeForwardBridge(JitCompiledFunction):
         score_mod = getattr(self.kernel, "score_mod", None)
         mask_mod = getattr(self.kernel, "mask_mod", None)
         softcap, score_mod = _extract_softcap_score_mod_components(score_mod)
-        if block_sparse_tensors is not None:
+        if _can_use_native_dense_backend(
+            is_varlen=is_varlen,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            softcap=softcap,
+            learnable_sink=learnable_sink,
+            block_sparse_tensors=block_sparse_tensors,
+            window_size=window_size,
+        ):
+            block_size = None
+            try:
+                shim_out, shim_lse = flash_attn_dense_forward_native(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=bool(getattr(self.kernel, "is_causal", False)),
+                    window_size=window_size,
+                    return_lse=lse is not None,
+                )
+            except Exception:
+                shim_out, shim_lse = shim.flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    softcap=0.0,
+                    mask_mod=None,
+                    **common,
+                )
+        elif block_sparse_tensors is not None:
             mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = block_sparse_tensors
             kernel_q_subtile_factor = getattr(self.kernel, "q_subtile_factor", None)
             q_subtile_factor = None if kernel_q_subtile_factor is None else int(kernel_q_subtile_factor or 1)
@@ -335,7 +389,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                     page_table=page_table,
                     softmax_scale=softmax_scale,
                     causal=bool(getattr(self.kernel, "is_causal", False)),
-                    window_size=_window_tuple(window_size_left, window_size_right),
+                    window_size=window_size,
                     learnable_sink=learnable_sink,
                     softcap=softcap or 0.0,
                     score_mod=score_mod,
@@ -355,7 +409,7 @@ class NativeProbeForwardBridge(JitCompiledFunction):
                     v,
                     softmax_scale=softmax_scale,
                     causal=bool(getattr(self.kernel, "is_causal", False)),
-                    window_size=_window_tuple(window_size_left, window_size_right),
+                    window_size=window_size,
                     learnable_sink=learnable_sink,
                     softcap=softcap or 0.0,
                     score_mod=score_mod,
@@ -528,10 +582,11 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
             q_req = q.detach().clone().requires_grad_(True)
             k_req = k.detach().clone().requires_grad_(True)
             v_req = v.detach().clone().requires_grad_(True)
+            window_size = _window_tuple(window_size_left, window_size_right)
             common = dict(
                 softmax_scale=softmax_scale,
                 causal=bool(getattr(self.kernel, "is_causal", False)),
-                window_size=_window_tuple(window_size_left, window_size_right),
+                window_size=window_size,
                 return_lse=dlse is not None,
             )
             is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k))
@@ -567,7 +622,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                         page_table=page_table,
                         softmax_scale=softmax_scale,
                         causal=bool(getattr(self.kernel, "is_causal", False)),
-                        window_size=_window_tuple(window_size_left, window_size_right),
+                        window_size=window_size,
                         learnable_sink=learnable_sink,
                         softcap=softcap_value,
                         score_mod=score_mod,
@@ -587,7 +642,7 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                         v_req,
                         softmax_scale=softmax_scale,
                         causal=bool(getattr(self.kernel, "is_causal", False)),
-                        window_size=_window_tuple(window_size_left, window_size_right),
+                        window_size=window_size,
                         learnable_sink=learnable_sink,
                         softcap=softcap_value,
                         score_mod=score_mod,
@@ -602,6 +657,35 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                         offset_q=0,
                         offset_k=0,
                         return_lse=dlse is not None,
+                    )
+            elif _can_use_native_dense_backend(
+                is_varlen=is_varlen,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                softcap=softcap_value,
+                learnable_sink=learnable_sink,
+                block_sparse_tensors=None,
+                window_size=window_size,
+            ):
+                try:
+                    shim_out, shim_lse = flash_attn_dense_forward_native(
+                        q_req,
+                        k_req,
+                        v_req,
+                        softmax_scale=softmax_scale,
+                        causal=bool(getattr(self.kernel, "is_causal", False)),
+                        window_size=window_size,
+                        return_lse=dlse is not None,
+                    )
+                except Exception:
+                    shim_out, shim_lse = shim.flash_attn_func(
+                        q_req,
+                        k_req,
+                        v_req,
+                        learnable_sink=None,
+                        softcap=0.0,
+                        mask_mod=None,
+                        **common,
                     )
             elif is_varlen:
                 shim_out, shim_lse = shim.flash_attn_varlen_func(

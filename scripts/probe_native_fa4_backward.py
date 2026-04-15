@@ -721,6 +721,7 @@ def main() -> int:
     from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
     import flash_attn.cute.interface as iface
     from cutlass.cute._compile_bridge import compat_replay_varlen_backward
+    from cutlass.cute._native_dense_backend import native_dense_backend_status
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the native backward probe")
@@ -728,6 +729,7 @@ def main() -> int:
     shim_mod = _load_windows_shim_module()
     print(f"native_interface={interface_target}")
     print(f"loaded_interface={getattr(iface, '__file__', '<unknown>')}")
+    print(f"native_dense_backend_pre={native_dense_backend_status()}")
     for runner in (
         lambda: _run_dense(flash_attn_func, shim_mod),
         lambda: _run_dense_deterministic(flash_attn_func, shim_mod),
@@ -745,6 +747,7 @@ def main() -> int:
     ):
         _clear_compile_caches(iface)
         runner()
+    print(f"native_dense_backend_post={native_dense_backend_status()}")
     return 0
 
 

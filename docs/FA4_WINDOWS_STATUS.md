@@ -259,6 +259,7 @@ Current probe result:
 - `scripts/probe_native_fa4_forward.py` now reaches a tiny CUDA forward call through that native path
 - recognized FA4 forward-kernel `cute.compile(...)` calls now return a real `NativeProbeForwardBridge` object instead of a dead placeholder
 - that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
+- the plain batched dense forward family now also routes through a repo-built Windows extension module (`fa4_windows_native_dense_ext*.pyd`) for the no-window, no-modifier path
 - recognized FA4 forward-combine `cute.compile(...)` calls now also return a real `NativeProbeForwardCombineBridge`
 - that forward-combine bridge now also handles `num_splits_dynamic_ptr`, with exact parity in both the batched and varlen dynamic-split probe cases
 - the forward-combine bridge now builds and loads a real Windows extension module (`fa4_windows_native_combine_ext*.pyd`) through `cutlass_runtime/src/cutlass/cute/_native_backend.py`
@@ -364,13 +365,16 @@ Observed cubin loader probe output:
 
 So the modifier surface is now much cleaner:
 
+- the plain batched dense forward path now reaches a compiled Windows backend slice for the tested no-window, no-modifier case
 - dense `softcap`, `learnable_sink`, and `mask_mod` are stable on the native probe bridge path in both forward and backward parity probes
 - varlen `softcap` is stable on the native probe bridge path
 - varlen `seqused_q` / `seqused_k` and the mixed `seqused + score_mod` backward path are now also stable on the native probe bridge path
 - varlen paged-KV is now stable on the native probe bridge path in both forward and backward parity probes
 - varlen `softcap + score_mod` is now stable on the native probe bridge path in both forward and backward parity probes
 - the internal varlen block-sparse path now reaches the native probe bridge exactly in forward parity probes, and the repo-local backward replay helper matches the stable shim exactly for the same tensors
+- the repo-local overlay now degrades block sparsity with `num_splits > 1` to a compatible non-split path instead of raising `NotImplementedError`
 - the upstream forward-combine path is now also stable on the native probe path for the tested batched and varlen cases, and that family is no longer backed by the Python shim core
+- the dense backward replay path now also reuses that compiled dense backend for the same plain family, and the seeded backward probe remains exact against the stable Windows shim
 - the upstream block-sparsity precompute path is now also stable on the native probe bridge path for the tested exact and fast-sampling cases
 
 That means the main forward path is no longer blocked by a dead placeholder for these recognized
@@ -401,6 +405,7 @@ At the moment this repo contains:
   - missing top-level `cutlass.cute`, now fixed by `cutlass_runtime/`
   - direct cubin loading, now fixed by the runtime-library shim path
 - upstream forward-combine and block-sparsity compile families, now covered by probe bridges
+- upstream plain dense forward, now covered by a second compiled Windows backend slice
 - direct bridge validation now also covers block-sparse forward execution and dynamic split-aware combine execution
 - shim validator coverage now also includes varlen paged-KV and combined varlen `softcap + score_mod`
 - the remaining honest blocker: no true end-to-end Windows CuTe DSL compiler/runtime behind the rest of that import surface
@@ -410,7 +415,9 @@ At the moment this repo contains:
 - the `cutlass.base_dsl.runtime.cuda` loader path is now repo-local instead of resolving from `native_probe_shims/`
 - the currently imported `cutlass_dsl`, `pipeline`, `utils`, and `_mlir` surfaces are now also repo-local, and the native import probe reports `cutlass_shim_module_count=0`
 - a repo-local `flash_attn_runtime/` overlay that now owns the active `flash_attn.cute.interface` runtime path inside this repo
-- a first real compiled Windows backend slice for the forward-combine family under `cutlass_runtime/src/cutlass/cute/_native_backend.py` and `_native_combine_backend.cpp`
+- repo-built compiled Windows backend slices for:
+  - the forward-combine family under `cutlass_runtime/src/cutlass/cute/_native_backend.py` and `_native_combine_backend.cpp`
+  - the plain dense forward family under `cutlass_runtime/src/cutlass/cute/_native_dense_backend.py` and `_native_dense_backend.cpp`
 - a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, the mixed packed/padded varlen layouts, and the public backward replay for dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod`
 
 It does **not** yet contain a verified native Windows FA4 runtime path.

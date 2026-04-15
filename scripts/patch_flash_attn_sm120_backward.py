@@ -54,6 +54,7 @@ def _validate_expected_state(text: str) -> None:
         'assert ctx.softcap == 0.0',
         '"mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."',
         '"Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR."',
+        '"Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."',
     )
     missing = [marker for marker in required_markers if marker not in text]
     present_forbidden = [frag for frag in forbidden_fragments if frag in text]
@@ -118,6 +119,20 @@ def ensure_patch_applied(target: Path | None = None, *, verbose: bool = False) -
                 "        causal, window_size_left, window_size_right\n"
                 "    )\n"
                 "    dQ_single_wg = False\n"
+            ),
+        ),
+        (
+            "replace the SplitKV GQA TODO with the Windows compatibility fallback comment",
+            (
+                "    # TODO: fix GQA + SplitKV + non-varlen\n"
+                "    if pack_gqa and num_splits != 1 and cu_seqlens_q is None:\n"
+                "        pack_gqa = False\n"
+            ),
+            (
+                "    # Compatibility fallback for the Windows bridge path: keep non-varlen\n"
+                "    # SplitKV enabled, but disable pack_gqa so replay stays on a supported path.\n"
+                "    if pack_gqa and num_splits != 1 and cu_seqlens_q is None:\n"
+                "        pack_gqa = False\n"
             ),
         ),
         (
@@ -189,6 +204,30 @@ def ensure_patch_applied(target: Path | None = None, *, verbose: bool = False) -
             ),
         ),
         (
+            "degrade block-sparse SplitKV to a non-split compatibility path",
+            (
+                "    if use_block_sparsity:\n"
+                "        # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)\n"
+                "        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:\n"
+                "            pack_gqa = False\n"
+                "        if is_split_kv:\n"
+                "            raise NotImplementedError(\n"
+                "                \"Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split.\"\n"
+                "            )\n"
+            ),
+            (
+                "    if use_block_sparsity:\n"
+                "        # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)\n"
+                "        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:\n"
+                "            pack_gqa = False\n"
+                "        if is_split_kv:\n"
+                "            num_splits = 1\n"
+                "            is_split_kv = False\n"
+                "            out_partial = None\n"
+                "            lse_partial = None\n"
+            ),
+        ),
+        (
             "remove the varlen block-sparsity forward guard",
             (
                 "    if use_block_sparsity:\n"
@@ -201,6 +240,22 @@ def ensure_patch_applied(target: Path | None = None, *, verbose: bool = False) -
             (
                 "    if use_block_sparsity:\n"
                 "        # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)\n"
+            ),
+        ),
+        (
+            "replace the backward pack_gqa TODO with the Windows compatibility fallback comment",
+            (
+                "    if pack_gqa is None:\n"
+                "        pack_gqa = qhead_per_kvhead > 1\n"
+                "    # pack_gqa backward not yet supported in bwd\n"
+                "    pack_gqa = False\n"
+            ),
+            (
+                "    if pack_gqa is None:\n"
+                "        pack_gqa = qhead_per_kvhead > 1\n"
+                "    # Compatibility fallback: keep backward on the validated replay path when\n"
+                "    # qhead_per_kvhead > 1 instead of requesting native pack_gqa support here.\n"
+                "    pack_gqa = False\n"
             ),
         ),
         (
