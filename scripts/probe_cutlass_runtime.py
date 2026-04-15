@@ -74,6 +74,8 @@ def main() -> int:
 
     import cutlass
     import cutlass.cute as cute
+    import cutlass.cute._compile_bridge as cute_compile_bridge
+    import cutlass.base_dsl.runtime.cuda as runtime_cuda_module
 
     print(f"cutlass_dist={_dist_version('cutlass')}")
     print(f"nvidia_cutlass_dsl_dist={_dist_version('nvidia-cutlass-dsl')}")
@@ -84,9 +86,11 @@ def main() -> int:
     print(f"cutlass_probe_reason={getattr(cutlass, 'NATIVE_PROBE_REASON', '<unknown>')}")
     print(f"cutlass_probe_versions={getattr(cutlass, 'NATIVE_PROBE_DIST_VERSIONS', {})}")
     print(f"cute_file={getattr(cute, '__file__', '<missing>')}")
+    print(f"cute_compile_bridge_file={getattr(cute_compile_bridge, '__file__', '<missing>')}")
     print(f"cute_compile_type={type(getattr(cute, 'compile', None)).__name__}")
     print(f"cute_compile_repr={repr(getattr(cute, 'compile', None))}")
     print(f"pycute_loaded={'pycute' in sys.modules}")
+    print(f"runtime_cuda_file={getattr(runtime_cuda_module, '__file__', '<missing>')}")
 
     runtime_cuda = getattr(getattr(getattr(cutlass, "base_dsl", None), "runtime", None), "cuda", None)
     load_cubin = getattr(runtime_cuda, "load_cubin_module_data", None)
@@ -110,6 +114,10 @@ def main() -> int:
         blockers.append("cutlass.cute still imported external pycute")
     if "cutlass_runtime\\src\\cutlass\\cute\\__init__.py" not in str(getattr(cute, "__file__", "")).lower():
         blockers.append("cutlass.cute is not resolving from the repo-local runtime package")
+    if "cutlass_runtime\\src\\cutlass\\cute\\_compile_bridge.py" not in str(getattr(cute_compile_bridge, "__file__", "")).lower():
+        blockers.append("cutlass.cute._compile_bridge is not resolving from the repo-local runtime package")
+    if "cutlass_runtime\\src\\cutlass\\base_dsl\\runtime\\cuda.py" not in str(getattr(runtime_cuda_module, "__file__", "")).lower():
+        blockers.append("cutlass.base_dsl.runtime.cuda is not resolving from the repo-local runtime package")
     print(f"modern_runtime_ready={len(blockers) == 0}")
     print(f"modern_runtime_blockers={blockers}")
     return 0

@@ -32,6 +32,40 @@ def _collapse_consecutive_duplicates(text: str, needle: str) -> tuple[str, bool]
     return text, changed
 
 
+def _validate_expected_state(text: str) -> None:
+    required_markers = (
+        "def _windows_compose_softcap_scoremod(score_mod, softcap):",
+        "score_mod = _windows_compose_softcap_scoremod(score_mod, softcap)",
+        "dQ_single_wg = False",
+        "ctx.page_table = page_table",
+        "ctx.score_mod = score_mod",
+        "ctx.aux_tensors = aux_tensors",
+        "ctx.learnable_sink = learnable_sink",
+        "from cutlass.cute._compile_bridge import compat_replay_varlen_backward",
+        "dq, dk, dv = compat_replay_varlen_backward(",
+    )
+    forbidden_fragments = (
+        'assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"',
+        'assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"',
+        '"softcap and score_mod cannot be used together"',
+        '"Block sparsity backward not supported on SM 12.0"',
+        '"score_mod backward not supported on SM 12.0"',
+        '"mask_mod backward not supported on SM 12.0"',
+        'assert ctx.softcap == 0.0',
+        '"mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."',
+        '"Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR."',
+    )
+    missing = [marker for marker in required_markers if marker not in text]
+    present_forbidden = [frag for frag in forbidden_fragments if frag in text]
+    if missing or present_forbidden:
+        details: list[str] = []
+        if missing:
+            details.append("missing markers: " + "; ".join(missing))
+        if present_forbidden:
+            details.append("forbidden fragments still present: " + "; ".join(present_forbidden))
+        raise RuntimeError("patch verification failed: " + " | ".join(details))
+
+
 def main() -> None:
     target = Path(sys.argv[1]) if len(sys.argv) > 1 else _default_target()
     text = target.read_text(encoding="utf-8")
@@ -304,14 +338,18 @@ def main() -> None:
         if changed:
             applied_labels.append(label)
 
+    _validate_expected_state(text)
+
     if text == original_text:
         print(f"already patched: {target}")
+        print("- verification=ok")
         return
 
     target.write_text(text, encoding="utf-8")
     print(f"patched {target}")
     for label in applied_labels:
         print(f"- {label}")
+    print("- verification=ok")
 
 
 if __name__ == "__main__":

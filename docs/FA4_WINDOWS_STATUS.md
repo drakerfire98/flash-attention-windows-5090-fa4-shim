@@ -110,15 +110,15 @@ That means the environment is now entering through:
 
 but deeper execution still ultimately delegates into repo-local bridge pieces such as:
 
-- `native_probe_shims/cutlass/cute/_compile_bridge.py`
-- `native_probe_shims/cutlass/base_dsl/runtime/cuda.py`
 - other repo-local probe subpackages behind the runtime package
+- selective wrappers in `native_probe_shims/` that now point back to the runtime-owned implementations for compatibility
 
 rather than from a separately packaged modern Windows CUTLASS runtime. The
 new `cutlass_runtime/` package now owns both the top-level `cutlass` root and
-the top-level `cutlass.cute` package surface, but it still routes recognized
-kernels through repo-local bridge layers rather than a true native Windows
-CuTe/CUTLASS DSL runtime.
+the top-level `cutlass.cute` package surface, and it now also owns the heavy
+`cutlass.cute._compile_bridge` logic plus the `cutlass.base_dsl.runtime.cuda`
+loader path. It still routes recognized kernels through repo-local bridge
+layers rather than a true native Windows CuTe/CUTLASS DSL runtime.
 
 ## Shim Progress
 
@@ -347,7 +347,8 @@ Observed cubin loader probe output:
 
 - `cutlass_spec` resolves through `cutlass_runtime/src/cutlass/__init__.py`
 - `cutlass.cute` resolves through `cutlass_runtime/src/cutlass/cute/__init__.py`
-- `runtime_cuda_module` resolves through `native_probe_shims/cutlass/base_dsl/runtime/cuda.py`
+- `cutlass.cute._compile_bridge` resolves through `cutlass_runtime/src/cutlass/cute/_compile_bridge.py`
+- `runtime_cuda_module` resolves through `cutlass_runtime/src/cutlass/base_dsl/runtime/cuda.py`
 - `cudaLibraryLoadData` succeeds on an NVRTC-built cubin
 - `cudaLibraryGetKernel` resolves the probe kernel successfully
 - `cudaLibraryUnload` succeeds cleanly
@@ -393,9 +394,12 @@ At the moment this repo contains:
   - direct cubin loading, now fixed by the runtime-library shim path
 - upstream forward-combine and block-sparsity compile families, now covered by probe bridges
 - direct bridge validation now also covers block-sparse forward execution and dynamic split-aware combine execution
+- shim validator coverage now also includes varlen paged-KV and combined varlen `softcap + score_mod`
 - the remaining honest blocker: no true end-to-end Windows CuTe DSL compiler/runtime behind that import surface
 - the top-level `cutlass` root is now repo-local instead of the legacy editable CUTLASS root
 - the top-level `cutlass.cute` package is now also repo-local instead of resolving from `native_probe_shims/`
+- the heavy `cutlass.cute._compile_bridge` logic is now repo-local instead of loaded from `native_probe_shims/`
+- the `cutlass.base_dsl.runtime.cuda` loader path is now repo-local instead of resolving from `native_probe_shims/`
 - a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, and the mixed packed/padded varlen layouts
 
 It does **not** yet contain a verified native Windows FA4 runtime path.
@@ -404,10 +408,9 @@ It does **not** yet contain a verified native Windows FA4 runtime path.
 
 The next promising route is one of:
 
-1. Replace the current `cutlass_runtime/` wrapper plus legacy CUTLASS delegation with a true Windows `cutlass.cute` runtime package.
-2. Internalize the remaining deeper bridge/runtime modules into `cutlass_runtime/` so fewer imports fall through to `native_probe_shims/`.
-3. Build or locate the real CuTe DSL compiler/runtime layer so `cutlass.cute.compile` stops resolving recognized kernels to selective bridge objects.
-4. If Windows wheels do not materialize, build the missing CUTLASS DSL runtime from source or vendor the required pieces into a separate Windows-focused bridge layer.
-5. Keep both `runtime_compat/` and `cutlass_runtime/` small and installable so other Windows users can quickly reproduce the same honest blocker chain.
-6. Extend the shim only when more FA4 surface area is actually needed, keeping unsupported features explicit instead of silently approximated.
-7. Re-test native FA4 when upstream or community Windows packaging for the CUTLASS DSL layer matures.
+1. Internalize the remaining deeper probe subpackages into `cutlass_runtime/` so fewer imports fall through to `native_probe_shims/`.
+2. Build or locate the real CuTe DSL compiler/runtime layer so `cutlass.cute.compile` stops resolving recognized kernels to selective bridge objects.
+3. If Windows wheels do not materialize, build the missing CUTLASS DSL runtime from source or vendor the required pieces into a separate Windows-focused bridge layer.
+4. Keep both `runtime_compat/` and `cutlass_runtime/` small and installable so other Windows users can quickly reproduce the same honest blocker chain.
+5. Extend the shim only when more FA4 surface area is actually needed, keeping unsupported features explicit instead of silently approximated.
+6. Re-test native FA4 when upstream or community Windows packaging for the CUTLASS DSL layer matures.
