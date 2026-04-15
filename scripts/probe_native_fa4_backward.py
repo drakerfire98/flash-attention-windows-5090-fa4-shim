@@ -36,6 +36,23 @@ def _mean_grad_diff(native: tuple[torch.Tensor, ...], ref: tuple[torch.Tensor, .
     return max((a.float() - b.float()).abs().mean().item() for a, b in zip(native, ref))
 
 
+def _clear_compile_caches(iface) -> None:
+    for attr_name in (
+        "_flash_attn_fwd",
+        "_flash_attn_bwd",
+        "_flash_attn_fwd_combine",
+        "_bwd_preprocess",
+        "_bwd_postprocess_convert",
+    ):
+        fn = getattr(iface, attr_name, None)
+        compile_cache = getattr(fn, "compile_cache", None)
+        cache_dict = getattr(compile_cache, "cache", None)
+        if hasattr(cache_dict, "clear"):
+            cache_dict.clear()
+        elif hasattr(compile_cache, "clear"):
+            compile_cache.clear()
+
+
 def _run_dense(native_flash_attn_func, shim_mod):
     torch.manual_seed(0)
     q = torch.randn(1, 16, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -91,6 +108,48 @@ def _run_varlen(native_flash_attn_varlen_func, shim_mod):
     print(f"varlen_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
 
 
+def _run_varlen_seqused(native_flash_attn_varlen_func, shim_mod):
+    torch.manual_seed(31)
+    q = torch.randn(2, 6, 2, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, 7, 2, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(2, 7, 2, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    seqused_q = torch.tensor([4, 6], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor([5, 7], device="cuda", dtype=torch.int32)
+    native_out, native_lse = native_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        causal=True,
+        return_lse=True,
+    )
+    native_loss = native_out.float().sum() + 0.05 * native_lse.float().masked_fill(torch.isneginf(native_lse), 0.0).sum()
+    native_loss.backward()
+    native_grads = (q.grad.detach().clone(), k.grad.detach().clone(), v.grad.detach().clone())
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    ref_out, ref_lse = shim_mod.flash_attn_varlen_func(
+        q_ref,
+        k_ref,
+        v_ref,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        causal=True,
+        return_lse=True,
+    )
+    ref_loss = ref_out.float().sum() + 0.05 * ref_lse.float().masked_fill(torch.isneginf(ref_lse), 0.0).sum()
+    ref_loss.backward()
+    ref_grads = (q_ref.grad.detach().clone(), k_ref.grad.detach().clone(), v_ref.grad.detach().clone())
+
+    print("case=varlen_seqused")
+    print(f"varlen_seqused_out_max_diff={(native_out.float() - ref_out.float()).abs().max().item()}")
+    print(f"varlen_seqused_grad_max_diff={_max_grad_diff(native_grads, ref_grads)}")
+    print(f"varlen_seqused_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
+
+
 def _run_dense_softcap(native_flash_attn_func, shim_mod):
     torch.manual_seed(5)
     q = torch.randn(1, 12, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -119,19 +178,81 @@ def _run_dense_softcap(native_flash_attn_func, shim_mod):
     print(f"dense_softcap_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
 
 
+def _run_varlen_seqused_score_mod(native_flash_attn_varlen_func, shim_mod):
+    torch.manual_seed(41)
+    seqused_q = torch.tensor([3, 4], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor([2, 5], device="cuda", dtype=torch.int32)
+    q = torch.randn(2, 5, 2, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, 6, 2, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(2, 6, 2, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    q_bias = torch.linspace(-0.3, 0.4, steps=int(seqused_q.sum().item()), device="cuda", dtype=torch.float32)
+    kv_bias = torch.linspace(-0.2, 0.5, steps=int(seqused_k.sum().item()), device="cuda", dtype=torch.float32)
+
+    def mixed_info_score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, info):
+        del batch_idx, head_idx
+        return (
+            scores
+            + q_bias[q_idx + info.offset_q].to(torch.float32)
+            + kv_bias[kv_idx + info.offset_k].to(torch.float32)
+        )
+
+    native_out, native_lse = native_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        causal=True,
+        score_mod=mixed_info_score_mod,
+        return_lse=True,
+    )
+    native_loss = native_out.float().sum() + 0.05 * native_lse.float().masked_fill(torch.isneginf(native_lse), 0.0).sum()
+    native_loss.backward()
+    native_grads = (q.grad.detach().clone(), k.grad.detach().clone(), v.grad.detach().clone())
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    ref_out, ref_lse = shim_mod.flash_attn_varlen_func(
+        q_ref,
+        k_ref,
+        v_ref,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        causal=True,
+        score_mod=mixed_info_score_mod,
+        return_lse=True,
+    )
+    ref_loss = ref_out.float().sum() + 0.05 * ref_lse.float().masked_fill(torch.isneginf(ref_lse), 0.0).sum()
+    ref_loss.backward()
+    ref_grads = (q_ref.grad.detach().clone(), k_ref.grad.detach().clone(), v_ref.grad.detach().clone())
+
+    print("case=varlen_seqused_score_mod")
+    print(f"varlen_seqused_score_mod_out_max_diff={(native_out.float() - ref_out.float()).abs().max().item()}")
+    print(f"varlen_seqused_score_mod_grad_max_diff={_max_grad_diff(native_grads, ref_grads)}")
+    print(f"varlen_seqused_score_mod_grad_mean_diff={_mean_grad_diff(native_grads, ref_grads)}")
+
+
 def main() -> int:
     repo_root = _repo_root()
     sys.path.insert(0, str(repo_root / "native_probe_shims"))
 
     from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+    import flash_attn.cute.interface as iface
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the native backward probe")
 
     shim_mod = _load_windows_shim_module()
-    _run_dense(flash_attn_func, shim_mod)
-    _run_dense_softcap(flash_attn_func, shim_mod)
-    _run_varlen(flash_attn_varlen_func, shim_mod)
+    for runner in (
+        lambda: _run_dense(flash_attn_func, shim_mod),
+        lambda: _run_dense_softcap(flash_attn_func, shim_mod),
+        lambda: _run_varlen(flash_attn_varlen_func, shim_mod),
+        lambda: _run_varlen_seqused(flash_attn_varlen_func, shim_mod),
+        lambda: _run_varlen_seqused_score_mod(flash_attn_varlen_func, shim_mod),
+    ):
+        _clear_compile_caches(iface)
+        runner()
     return 0
 
 
