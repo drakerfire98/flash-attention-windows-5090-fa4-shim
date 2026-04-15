@@ -37,6 +37,7 @@ Important packaging note:
 - `nvidia-cutlass-dsl` is present as the top-level Python distribution metadata in this env
 - but the separate runtime packages it declares, such as `nvidia-cutlass-dsl-libs-base==4.4.2`, are not importable on this Windows stack
 - querying PyPI from the isolated env for `nvidia-cutlass-dsl-libs-base` and `nvidia-cutlass-dsl-libs-cu13` returned `No matching distribution found`
+- a repo-local editable compat package can now be installed from `runtime_compat/` to restore the missing raw import surface without solving those missing runtime wheels
 
 ## What Fails In A Clean Import
 
@@ -46,7 +47,7 @@ The first real FA4 import still failed:
 from flash_attn.cute import flash_attn_func
 ```
 
-Observed error:
+Original observed error:
 
 ```text
 ImportError: cannot import name '__version__' from 'cuda' (unknown location)
@@ -54,26 +55,39 @@ ImportError: cannot import name '__version__' from 'cuda' (unknown location)
 
 That happens before the code even gets to `cutlass.cute`.
 
-## Native Blockers We Confirmed
+After installing the repo-local compat package with:
 
-There are now two confirmed native blockers on this Windows stack.
-
-1. CUTLASS expects the older top-level CUDA Python API shape.
-
-The linked CUTLASS Python tree imports:
-
-```python
-from cuda import __version__
-from cuda import cuda, cudart, nvrtc
+```powershell
+.\.venv_fa4\Scripts\python.exe -m pip install -e .\runtime_compat
 ```
 
-But the installed Windows CUDA Python packages expose a namespace layout under:
+the raw runtime probe now improves to:
 
-- `cuda.bindings.driver`
-- `cuda.bindings.runtime`
-- `cuda.bindings.nvrtc`
+- `raw_cutlass_import=ok`
+- `raw_cuda_import=ok`
+- `raw_nvidia_cutlass_dsl_import=ok`
 
-So a clean `import cutlass` fails immediately on `from cuda import __version__`.
+So the first import-shape mismatch is now stabilized on Windows even though the
+deeper native runtime is still incomplete.
+
+## Native Blockers We Confirmed
+
+There are now two deeper confirmed native blockers on this Windows stack after
+the raw import-shape fix.
+
+1. `cutlass` still resolves to the legacy editable CUTLASS tree, not a true modern Windows CUTLASS package.
+
+The runtime probe still reports:
+
+```text
+cutlass_probe_mode=legacy-editable-cutlass
+```
+
+That means the environment is still bootstrapping from:
+
+- `third_party/flash-attention-for-windows/csrc/cutlass/python/cutlass`
+
+rather than from a separately packaged modern Windows CUTLASS runtime.
 
 2. The linked CUTLASS Python tree still does not contain `cutlass.cute`.
 
@@ -94,7 +108,8 @@ and it does **not** contain:
 
 - `cutlass/cute/`
 
-So even after forcing a temporary in-memory CUDA compatibility shim that allows `import cutlass`, the next native failure is still:
+So even after stabilizing the raw import surface with the installed compat layer,
+the next native failure is still:
 
 ```text
 ModuleNotFoundError: No module named 'cutlass.cute'
@@ -198,6 +213,9 @@ blocker without pretending the backend is fully implemented.
 Current probe result:
 
 - `scripts/probe_cutlass_runtime.py` now reports which CUTLASS package the native probe actually selected
+- the repo-local editable package under `runtime_compat/` now fixes the raw Windows import mismatch directly:
+  - `cuda` becomes importable as a regular package with `__version__`, `cuda`, `cudart`, and `nvrtc`
+  - `nvidia_cutlass_dsl` becomes importable as a real top-level module name
 - the probe now auto-prefers a real modern CUTLASS package if one ever becomes importable on this machine
 - on the current Windows env, no such modern package is importable, so the probe still falls back to the legacy editable CUTLASS tree plus compatibility shims
 - `scripts/probe_native_fa4_import.py` now imports the real upstream `flash_attn.cute` package successfully
@@ -210,7 +228,7 @@ Current probe result:
 - recognized FA4 forward-kernel `cute.compile(...)` calls now return a real `NativeProbeForwardBridge` object instead of a dead placeholder
 - that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
 - recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
-- `scripts/probe_native_fa4_backward.py` now reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs in the current probe
+- `scripts/probe_native_fa4_backward.py` still reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs after the compat package is installed
 - the backward bridge now also preserves forward-only feature metadata across the preprocess step so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim
 - `scripts/patch_flash_attn_sm120_backward.py` now reapplies the local SM120 `dQ_single_wg = False` fix idempotently instead of relying on memory
 
@@ -304,9 +322,9 @@ It does **not** yet contain a verified native Windows FA4 runtime path.
 
 The next promising route is one of:
 
-1. Build or locate a Windows CUDA compatibility layer that exposes the old `from cuda import __version__, cuda, cudart, nvrtc` surface cleanly.
-2. Build or locate a CUTLASS Python package that actually provides `cutlass.cute` on Windows, not just the adjacent CUTLASS / pycute trees.
-3. Build or locate the real CuTe DSL compiler/runtime layer so `cutlass.cute.compile` and its runtime hooks stop resolving to probe placeholders.
-4. If Windows wheels do not materialize, build the missing CUTLASS DSL runtime from source or vendor the required pieces into a separate Windows-focused bridge layer.
+1. Build or locate a CUTLASS Python package that actually provides `cutlass.cute` on Windows, not just the adjacent CUTLASS / pycute trees.
+2. Build or locate the real CuTe DSL compiler/runtime layer so `cutlass.cute.compile` and its runtime hooks stop resolving to probe placeholders.
+3. If Windows wheels do not materialize, build the missing CUTLASS DSL runtime from source or vendor the required pieces into a separate Windows-focused bridge layer.
+4. Keep the `runtime_compat/` package small and installable so other Windows users can at least reach the same honest blocker chain quickly.
 5. Extend the shim only when more FA4 surface area is actually needed, keeping unsupported features explicit instead of silently approximated.
 6. Re-test native FA4 when upstream or community Windows packaging for the CUTLASS DSL layer matures.

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fa4-windows-runtime-compat"
+version = "0.1.0"
+description = "Windows compatibility imports for the legacy CUTLASS and FA4 Python runtime surface"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "drakerfire98"},
+]
+dependencies = [
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["cuda", "nvidia_cutlass_dsl"]
