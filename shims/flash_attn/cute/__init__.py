@@ -9,12 +9,27 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 __version__ = "0.0.0-windows-shim"
+
+
+class BlockSparseTensors(NamedTuple):
+    mask_block_cnt: torch.Tensor
+    mask_block_idx: torch.Tensor
+    full_block_cnt: torch.Tensor | None
+    full_block_idx: torch.Tensor | None
+
+
+class BlockSparseTensorsTorch(NamedTuple):
+    mask_block_cnt: torch.Tensor
+    mask_block_idx: torch.Tensor
+    full_block_cnt: torch.Tensor | None = None
+    full_block_idx: torch.Tensor | None = None
+    block_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -715,6 +730,200 @@ def _combine_split_attention(
     return out, lse
 
 
+def _coerce_python_int(value: int | torch.Tensor) -> int:
+    if torch.is_tensor(value):
+        return int(value.item())
+    return int(value)
+
+
+def _mask_mod_scalar(
+    mask_mod: Callable,
+    *,
+    batch_idx: int,
+    head_idx: int,
+    q_idx: int,
+    kv_idx: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    aux_tensors: Optional[list],
+    device: torch.device,
+) -> bool:
+    like = torch.zeros((), device=device, dtype=torch.bool)
+    seqlen_info = _make_seqlen_info(
+        device=device,
+        offset_q=0,
+        offset_k=0,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+    )
+    result = _call_mask_mod(
+        mask_mod,
+        like=like,
+        batch_idx=torch.tensor(batch_idx, device=device, dtype=torch.long),
+        head_idx=torch.tensor(head_idx, device=device, dtype=torch.long),
+        q_idx=torch.tensor(q_idx, device=device, dtype=torch.long),
+        kv_idx=torch.tensor(kv_idx, device=device, dtype=torch.long),
+        seqlen_info=seqlen_info,
+        aux_tensors=aux_tensors,
+    )
+    return bool(result.item())
+
+
+def _block_sampling_points(
+    m_base: int,
+    n_base: int,
+    *,
+    tile_m: int,
+    tile_n: int,
+    seqlen_q: int,
+    seqlen_k: int,
+) -> list[tuple[int, int]]:
+    if m_base >= seqlen_q or n_base >= seqlen_k:
+        return []
+    q_last = min(m_base + tile_m - 1, seqlen_q - 1)
+    k_last = min(n_base + tile_n - 1, seqlen_k - 1)
+    q_mid = m_base + min(seqlen_q - m_base, tile_m) // 2
+    k_mid = n_base + min(seqlen_k - n_base, tile_n) // 2
+    return [
+        (m_base, n_base),
+        (m_base, k_last),
+        (q_last, n_base),
+        (q_last, k_last),
+        (q_mid, k_mid),
+    ]
+
+
+def _classify_block(
+    mask_mod: Callable,
+    *,
+    batch_idx: int,
+    head_idx: int,
+    m_base: int,
+    n_base: int,
+    tile_m: int,
+    tile_n: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    aux_tensors: Optional[list],
+    device: torch.device,
+    use_fast_sampling: bool,
+) -> tuple[bool, bool]:
+    has_unmasked = False
+    has_masked = False
+
+    if use_fast_sampling:
+        points = _block_sampling_points(
+            m_base,
+            n_base,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+        )
+        for q_idx, kv_idx in points:
+            allowed = _mask_mod_scalar(
+                mask_mod,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                q_idx=q_idx,
+                kv_idx=kv_idx,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                aux_tensors=aux_tensors,
+                device=device,
+            )
+            has_unmasked |= allowed
+            has_masked |= not allowed
+            if has_unmasked and has_masked:
+                break
+        return has_unmasked, has_masked
+
+    for row_offset in range(tile_m):
+        q_idx = m_base + row_offset
+        if q_idx >= seqlen_q:
+            break
+        for col_offset in range(tile_n):
+            kv_idx = n_base + col_offset
+            if kv_idx >= seqlen_k:
+                break
+            allowed = _mask_mod_scalar(
+                mask_mod,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                q_idx=q_idx,
+                kv_idx=kv_idx,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                aux_tensors=aux_tensors,
+                device=device,
+            )
+            has_unmasked |= allowed
+            has_masked |= not allowed
+            if has_unmasked and has_masked:
+                return has_unmasked, has_masked
+    return has_unmasked, has_masked
+
+
+def _fill_block_sparse_tensors(
+    *,
+    tile_m: int,
+    tile_n: int,
+    batch_size: int,
+    num_heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    mask_mod: Callable,
+    aux_tensors: Optional[list],
+    device: torch.device,
+    compute_full_blocks: bool,
+    use_fast_sampling: bool,
+    mask_block_cnt: torch.Tensor,
+    mask_block_idx: torch.Tensor,
+    full_block_cnt: torch.Tensor | None,
+    full_block_idx: torch.Tensor | None,
+) -> None:
+    num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
+    num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
+    mask_block_cnt.zero_()
+    mask_block_idx.zero_()
+    if full_block_cnt is not None:
+        full_block_cnt.zero_()
+    if full_block_idx is not None:
+        full_block_idx.zero_()
+
+    for batch_idx in range(batch_size):
+        for head_idx in range(num_heads):
+            for m_block in range(num_m_blocks):
+                m_base = m_block * tile_m
+                mask_count = 0
+                full_count = 0
+                for n_block in range(num_n_blocks):
+                    n_base = n_block * tile_n
+                    has_unmasked, has_masked = _classify_block(
+                        mask_mod,
+                        batch_idx=batch_idx,
+                        head_idx=head_idx,
+                        m_base=m_base,
+                        n_base=n_base,
+                        tile_m=tile_m,
+                        tile_n=tile_n,
+                        seqlen_q=seqlen_q,
+                        seqlen_k=seqlen_k,
+                        aux_tensors=aux_tensors,
+                        device=device,
+                        use_fast_sampling=use_fast_sampling,
+                    )
+                    if has_unmasked and has_masked:
+                        mask_block_idx[batch_idx, head_idx, m_block, mask_count] = n_block
+                        mask_count += 1
+                    elif has_unmasked and compute_full_blocks and full_block_idx is not None:
+                        full_block_idx[batch_idx, head_idx, m_block, full_count] = n_block
+                        full_count += 1
+                mask_block_cnt[batch_idx, head_idx, m_block] = mask_count
+                if compute_full_blocks and full_block_cnt is not None:
+                    full_block_cnt[batch_idx, head_idx, m_block] = full_count
+
+
 def flash_attn_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
@@ -743,8 +952,96 @@ def flash_attn_combine(
     return out, combined_lse
 
 
+def fast_sampling(mask_mod: Callable) -> Callable:
+    mask_mod.use_fast_sampling = True
+    return mask_mod
+
+
+def compute_block_sparsity(
+    tile_m: int,
+    tile_n: int,
+    batch_size: int,
+    num_heads: int,
+    seqlen_q: int | torch.Tensor,
+    seqlen_k: int | torch.Tensor,
+    mask_mod: Callable,
+    aux_tensors: Optional[list],
+    device,
+    compute_full_blocks: bool = True,
+    use_fast_sampling: bool = False,
+) -> tuple[BlockSparseTensors, BlockSparseTensorsTorch]:
+    seqlen_q_int = _coerce_python_int(seqlen_q)
+    seqlen_k_int = _coerce_python_int(seqlen_k)
+    tile_m = int(tile_m)
+    tile_n = int(tile_n)
+    batch_size = int(batch_size)
+    num_heads = int(num_heads)
+    device = torch.device(device)
+    use_fast_sampling = bool(getattr(mask_mod, "use_fast_sampling", use_fast_sampling))
+
+    num_m_blocks = (seqlen_q_int + tile_m - 1) // tile_m
+    num_n_blocks = (seqlen_k_int + tile_n - 1) // tile_n
+    mask_block_cnt = torch.zeros(
+        (batch_size, num_heads, num_m_blocks),
+        device=device,
+        dtype=torch.int32,
+    )
+    mask_block_idx = torch.zeros(
+        (batch_size, num_heads, num_m_blocks, num_n_blocks),
+        device=device,
+        dtype=torch.int32,
+    )
+    full_block_cnt = (
+        torch.zeros((batch_size, num_heads, num_m_blocks), device=device, dtype=torch.int32)
+        if compute_full_blocks
+        else None
+    )
+    full_block_idx = (
+        torch.zeros((batch_size, num_heads, num_m_blocks, num_n_blocks), device=device, dtype=torch.int32)
+        if compute_full_blocks
+        else None
+    )
+
+    _fill_block_sparse_tensors(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        seqlen_q=seqlen_q_int,
+        seqlen_k=seqlen_k_int,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        device=device,
+        compute_full_blocks=compute_full_blocks,
+        use_fast_sampling=use_fast_sampling,
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+    )
+
+    torch_tensors = BlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(tile_m, tile_n),
+    )
+    cute_tensors = BlockSparseTensors(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+    )
+    return cute_tensors, torch_tensors
+
+
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen_func",
     "flash_attn_combine",
+    "compute_block_sparsity",
+    "fast_sampling",
+    "BlockSparseTensors",
+    "BlockSparseTensorsTorch",
 ]

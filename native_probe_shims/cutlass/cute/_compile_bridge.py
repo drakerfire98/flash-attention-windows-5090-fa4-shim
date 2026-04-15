@@ -463,6 +463,43 @@ class NativeProbeForwardCombineBridge(JitCompiledFunction):
         _copy_tensor_like(lse, shim_lse)
 
 
+class NativeProbeBlockSparsityBridge(JitCompiledFunction):
+    def __init__(self, kernel: Any):
+        self.kernel = kernel
+
+    def __repr__(self) -> str:
+        return "<NativeProbeBlockSparsityBridge>"
+
+    def __call__(
+        self,
+        blocksparse_tensors_torch,
+        seqlen_q: int | torch.Tensor,
+        seqlen_k: int | torch.Tensor,
+        aux_tensors: list[torch.Tensor] | None,
+    ) -> None:
+        mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors_torch
+        device = mask_block_cnt.device
+        batch_size, num_heads, _ = mask_block_cnt.shape
+        shim = _load_windows_shim_module()
+        shim._fill_block_sparse_tensors(
+            tile_m=int(self.kernel.tile_mn[0]),
+            tile_n=int(self.kernel.tile_mn[1]),
+            batch_size=int(batch_size),
+            num_heads=int(num_heads),
+            seqlen_q=shim._coerce_python_int(seqlen_q),
+            seqlen_k=shim._coerce_python_int(seqlen_k),
+            mask_mod=self.kernel.mask_mod,
+            aux_tensors=aux_tensors,
+            device=device,
+            compute_full_blocks=bool(getattr(self.kernel, "compute_full_blocks", True)),
+            use_fast_sampling=bool(getattr(self.kernel, "use_fast_sampling", False)),
+            mask_block_cnt=mask_block_cnt,
+            mask_block_idx=mask_block_idx,
+            full_block_cnt=full_block_cnt,
+            full_block_idx=full_block_idx,
+        )
+
+
 class NativeProbeUnsupportedBridge(JitCompiledFunction):
     def __init__(self, op: Any):
         self.op = op
@@ -485,6 +522,8 @@ def compile_dispatch(op: Any, *args, **kwargs):
         return NativeProbeForwardBridge(op)
     if op_name == "FlashAttentionForwardCombine":
         return NativeProbeForwardCombineBridge()
+    if op_name == "BlockSparsityKernel":
+        return NativeProbeBlockSparsityBridge(op)
     if op_name == "FlashAttentionBackwardPreprocess":
         return NativeProbeBackwardPreprocessBridge()
     if op_name == "FlashAttentionBackwardPostprocess":

@@ -29,6 +29,7 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/probe_cutlass_runtime.py`: reports which CUTLASS runtime the native FA4 probe is actually using and why
 - `scripts/probe_cutlass_cubin_loader.py`: compiles a tiny NVRTC kernel and verifies the Windows CUTLASS runtime shim can load and resolve it
 - `scripts/probe_native_fa4_combine.py`: isolated native-path probe for the upstream forward-combine compile family
+- `scripts/probe_native_fa4_block_sparsity.py`: isolated native-path probe for the upstream block-sparsity compile family
 - `scripts/probe_native_fa4_import.py`: isolated native-path import probe using compatibility shims instead of the stable fallback
 - `scripts/probe_native_fa4_forward.py`: native-path forward probe covering base dense attention, dense `softcap`, dense `mask_mod`, and varlen `softcap`
 - `scripts/probe_native_fa4_backward.py`: dense + varlen native-path backward parity probe against the stable Windows shim
@@ -71,6 +72,7 @@ Current status:
 - the tiny native-path CUDA forward probe now reaches numerically sane dense output through that bridge, with close parity versus SDPA even when LSE is requested
 - the new native-path backward probe now reaches dense and varlen backward parity against the stable Windows shim with `0.0` output and grad diffs in the seeded checks
 - the upstream forward-combine compile family now also resolves through a real `NativeProbeForwardCombineBridge`, with exact batched and varlen parity versus the stable Windows shim in the new combine probe
+- the upstream `compute_block_sparsity(...)` compile family now also resolves through a real `NativeProbeBlockSparsityBridge`, with exact parity versus the stable Windows shim for both exact and fast-sampling test cases
 - the backward bridge now also preserves forward-only feature metadata so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim without changing the user-facing API call shape
 - widened native-path modifier probes now show:
   - dense `softcap` forward and backward parity are exact against the stable Windows shim

@@ -209,6 +209,7 @@ A second, isolated probe path now exists under:
 - `scripts/probe_native_fa4_forward.py`
 - `scripts/probe_native_fa4_backward.py`
 - `scripts/probe_native_fa4_combine.py`
+- `scripts/probe_native_fa4_block_sparsity.py`
 - `scripts/patch_flash_attn_sm120_backward.py`
 
 This path is separate from the stable fallback shim under `shims/`. Its only job is to push the
@@ -237,6 +238,7 @@ Current probe result:
 - recognized FA4 forward-kernel `cute.compile(...)` calls now return a real `NativeProbeForwardBridge` object instead of a dead placeholder
 - that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
 - recognized FA4 forward-combine `cute.compile(...)` calls now also return a real `NativeProbeForwardCombineBridge`
+- recognized FA4 `compute_block_sparsity(...)` `cute.compile(...)` calls now also return a real `NativeProbeBlockSparsityBridge`
 - recognized FA4 backward preprocess, main backward, and backward postprocess `cute.compile(...)` calls now also return bridge objects instead of dead placeholders
 - `scripts/probe_native_fa4_backward.py` still reaches dense and varlen backward parity against the stable Windows shim with `0.0` seeded output and grad diffs after the compat package is installed
 - the backward bridge now also preserves forward-only feature metadata across the preprocess step so unsupported SM120 backward surfaces can fall back compatibly onto the stable Windows shim
@@ -302,6 +304,12 @@ Observed forward-combine probe output:
 - varlen combine LSE max diff vs stable shim: `0.0`
 - `_flash_attn_fwd_combine.compile_cache` now holds `NativeProbeForwardCombineBridge`
 
+Observed block-sparsity probe output:
+
+- exact block-sparsity mask/full count and index tensors match the stable Windows shim exactly
+- fast-sampling block-sparsity mask/full count and index tensors also match the stable Windows shim exactly
+- `compute_block_sparsity.compile_cache` now holds `NativeProbeBlockSparsityBridge`
+
 Observed cubin loader probe output:
 
 - `cutlass_spec` resolves through `cutlass_runtime/src/cutlass/__init__.py`
@@ -316,6 +324,7 @@ So the modifier surface is now much cleaner:
 - varlen `softcap` is stable on the native probe bridge path
 - varlen `seqused_q` / `seqused_k` and the mixed `seqused + score_mod` backward path are now also stable on the native probe bridge path
 - the upstream forward-combine path is now also stable on the native probe bridge path for the tested batched and varlen cases
+- the upstream block-sparsity precompute path is now also stable on the native probe bridge path for the tested exact and fast-sampling cases
 
 That means the main forward path is no longer blocked by a dead placeholder for these recognized
 kernels, and the low-level Windows cubin hook is no longer dead either. The next real missing piece
@@ -343,6 +352,7 @@ At the moment this repo contains:
   - raw CUDA / `nvidia_cutlass_dsl` import mismatch, now fixed by `runtime_compat/`
   - missing top-level `cutlass.cute`, now fixed by `cutlass_runtime/`
   - direct cubin loading, now fixed by the runtime-library shim path
+  - upstream forward-combine and block-sparsity compile families, now covered by probe bridges
   - the remaining honest blocker: no true end-to-end Windows CuTe DSL compiler/runtime behind that import surface
 - a repo-local FA4 shim path that provides stable dense and varlen public-entrypoint fallbacks on Windows, including `learnable_sink`, dense `mask_mod`, varlen `score_mod`, `seqused_q`, and the mixed packed/padded varlen layouts
 

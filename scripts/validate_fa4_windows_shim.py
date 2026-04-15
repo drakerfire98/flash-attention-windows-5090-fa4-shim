@@ -462,7 +462,13 @@ def _manual_varlen_layout_ref(
 
 def main() -> int:
     _add_shim_path()
-    from flash_attn.cute import flash_attn_combine, flash_attn_func, flash_attn_varlen_func
+    from flash_attn.cute import (
+        compute_block_sparsity,
+        fast_sampling,
+        flash_attn_combine,
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this validation script")
@@ -484,6 +490,67 @@ def main() -> int:
     ref_out, ref_lse = _manual_combine_ref(out_partial, lse_partial)
     _assert_close("combine_varlen_out", out, ref_out, atol=0.0, rtol=0.0)
     _assert_close("combine_varlen_lse", lse, ref_lse, atol=0.0, rtol=0.0)
+
+    def causal_block_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        del batch_idx, head_idx, seqlen_info, aux_tensors
+        return kv_idx <= q_idx
+
+    _, sparse_tensors = compute_block_sparsity(
+        4,
+        4,
+        1,
+        1,
+        8,
+        8,
+        causal_block_mask,
+        None,
+        torch.device("cuda"),
+        compute_full_blocks=True,
+    )
+    expected_mask_cnt = torch.tensor([[[1, 1]]], device="cuda", dtype=torch.int32)
+    expected_mask_idx = torch.tensor([[[[0, 0], [1, 0]]]], device="cuda", dtype=torch.int32)
+    expected_full_cnt = torch.tensor([[[0, 1]]], device="cuda", dtype=torch.int32)
+    expected_full_idx = torch.tensor([[[[0, 0], [0, 0]]]], device="cuda", dtype=torch.int32)
+    _assert_close("block_sparse_mask_cnt", sparse_tensors.mask_block_cnt, expected_mask_cnt, atol=0.0, rtol=0.0)
+    _assert_close("block_sparse_mask_idx", sparse_tensors.mask_block_idx, expected_mask_idx, atol=0.0, rtol=0.0)
+    _assert_close("block_sparse_full_cnt", sparse_tensors.full_block_cnt, expected_full_cnt, atol=0.0, rtol=0.0)
+    _assert_close("block_sparse_full_idx", sparse_tensors.full_block_idx, expected_full_idx, atol=0.0, rtol=0.0)
+
+    @fast_sampling
+    def head_bias_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        del batch_idx, seqlen_info
+        return kv_idx <= (q_idx + aux_tensors[0][head_idx])
+
+    head_bias = torch.tensor([0, 1], device="cuda", dtype=torch.long)
+    _, sparse_tensors = compute_block_sparsity(
+        2,
+        2,
+        1,
+        2,
+        4,
+        4,
+        head_bias_mask,
+        [head_bias],
+        torch.device("cuda"),
+        compute_full_blocks=True,
+        use_fast_sampling=True,
+    )
+    expected_mask_cnt = torch.tensor([[[1, 1], [1, 0]]], device="cuda", dtype=torch.int32)
+    expected_mask_idx = torch.tensor(
+        [[[[0, 0], [1, 0]], [[1, 0], [0, 0]]]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    expected_full_cnt = torch.tensor([[[0, 1], [1, 2]]], device="cuda", dtype=torch.int32)
+    expected_full_idx = torch.tensor(
+        [[[[0, 0], [0, 0]], [[0, 0], [0, 1]]]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    _assert_close("block_sparse_fast_mask_cnt", sparse_tensors.mask_block_cnt, expected_mask_cnt, atol=0.0, rtol=0.0)
+    _assert_close("block_sparse_fast_mask_idx", sparse_tensors.mask_block_idx, expected_mask_idx, atol=0.0, rtol=0.0)
+    _assert_close("block_sparse_fast_full_cnt", sparse_tensors.full_block_cnt, expected_full_cnt, atol=0.0, rtol=0.0)
+    _assert_close("block_sparse_fast_full_idx", sparse_tensors.full_block_idx, expected_full_idx, atol=0.0, rtol=0.0)
 
     q = torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
