@@ -8,6 +8,8 @@ from pathlib import Path
 
 import torch
 
+from _native_probe_setup import ensure_native_fa4_patch, install_native_probe_paths
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -143,9 +145,8 @@ def _run_dynamic_varlen(iface, shim_mod):
 
 
 def main() -> int:
-    repo_root = _repo_root()
-    sys.path.insert(0, str(repo_root / "native_probe_shims"))
-    sys.path.insert(0, str(repo_root / "cutlass_runtime" / "src"))
+    install_native_probe_paths()
+    patched_target = ensure_native_fa4_patch()
 
     import flash_attn.cute.interface as iface
     import cutlass
@@ -154,6 +155,7 @@ def main() -> int:
         raise RuntimeError("CUDA is required for the native combine probe")
 
     shim_mod = _load_windows_shim_module()
+    print(f"patched_interface={patched_target}")
     print(f"cutlass_probe_mode={getattr(cutlass, 'NATIVE_PROBE_MODE', '<unknown>')}")
     print(f"cutlass_probe_reason={getattr(cutlass, 'NATIVE_PROBE_REASON', '<unknown>')}")
 

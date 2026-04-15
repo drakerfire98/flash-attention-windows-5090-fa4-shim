@@ -10,20 +10,21 @@ from __future__ import annotations
 
 import sys
 import traceback
-from pathlib import Path
 
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+from _native_probe_setup import (
+    ensure_native_fa4_patch,
+    install_native_probe_paths,
+    loaded_cutlass_shim_modules,
+)
 
 
 def main() -> int:
-    repo_root = _repo_root()
-    sys.path.insert(0, str(repo_root / "native_probe_shims"))
-    sys.path.insert(0, str(repo_root / "cutlass_runtime" / "src"))
+    runtime_src, shim_root = install_native_probe_paths()
+    patched_target = ensure_native_fa4_patch()
 
-    print(f"native_probe_shims={repo_root / 'native_probe_shims'}")
-    print(f"cutlass_runtime_src={repo_root / 'cutlass_runtime' / 'src'}")
+    print(f"native_probe_shims={shim_root}")
+    print(f"cutlass_runtime_src={runtime_src}")
+    print(f"patched_interface={patched_target}")
     try:
         import flash_attn.cute as fa4  # noqa: F401
         import cutlass
@@ -39,6 +40,10 @@ def main() -> int:
     print(f"cutlass_probe_init={getattr(cutlass, 'NATIVE_PROBE_CUTLASS_INIT', '<unknown>')}")
     print(f"cutlass_cute_file={getattr(cute, '__file__', '<unknown>')}")
     print(f"pycute_loaded={'pycute' in sys.modules}")
+    shim_modules = loaded_cutlass_shim_modules()
+    print(f"cutlass_shim_module_count={len(shim_modules)}")
+    for name, path in shim_modules:
+        print(f"cutlass_shim_module={name} -> {path}")
     return 0
 
 

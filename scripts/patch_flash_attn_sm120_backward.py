@@ -66,8 +66,8 @@ def _validate_expected_state(text: str) -> None:
         raise RuntimeError("patch verification failed: " + " | ".join(details))
 
 
-def main() -> None:
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else _default_target()
+def ensure_patch_applied(target: Path | None = None, *, verbose: bool = False) -> tuple[Path, bool]:
+    target = target or _default_target()
     text = target.read_text(encoding="utf-8")
     original_text = text
 
@@ -341,15 +341,23 @@ def main() -> None:
     _validate_expected_state(text)
 
     if text == original_text:
-        print(f"already patched: {target}")
-        print("- verification=ok")
-        return
+        if verbose:
+            print(f"already patched: {target}")
+            print("- verification=ok")
+        return target, False
 
     target.write_text(text, encoding="utf-8")
-    print(f"patched {target}")
-    for label in applied_labels:
-        print(f"- {label}")
-    print("- verification=ok")
+    if verbose:
+        print(f"patched {target}")
+        for label in applied_labels:
+            print(f"- {label}")
+        print("- verification=ok")
+    return target, True
+
+
+def main() -> None:
+    target = Path(sys.argv[1]) if len(sys.argv) > 1 else _default_target()
+    ensure_patch_applied(target, verbose=True)
 
 
 if __name__ == "__main__":

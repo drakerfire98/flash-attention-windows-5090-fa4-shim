@@ -17,6 +17,12 @@
   - `cutlass.base_dsl.__file__` and `cutlass.base_dsl.runtime.cuda.__file__` now resolve to the runtime package
   - local runtime-owned modules now cover `__init__.py`, `arch.py`, `typing.py`, `tvm_ffi_builder.py`, `runtime/__init__.py`, and `runtime/cuda.py`
   - `native_probe_shims/cutlass/base_dsl/runtime/cuda.py` is now just a compatibility wrapper back to the runtime-owned CUDA loader helpers
+- Added repo-local runtime-owned compatibility modules for the remaining CUTLASS import surfaces that were still leaking through `native_probe_shims/`:
+  - `cutlass_runtime/src/cutlass/cutlass_dsl.py`
+  - `cutlass_runtime/src/cutlass/pipeline.py`
+  - `cutlass_runtime/src/cutlass/utils/*`
+  - `cutlass_runtime/src/cutlass/_mlir/*`
+  - on the current native probe import path, `cutlass_shim_module_count=0`
 - Replaced the installable wrapper modules in:
   - `cutlass_runtime/src/_probe_helpers.py`
   - `cutlass_runtime/src/fcntl.py`
@@ -49,6 +55,10 @@
   - `scripts/probe_native_fa4_forward.py`
   - `scripts/probe_native_fa4_backward.py`
   - new coverage now includes varlen paged-KV, varlen `softcap + score_mod`, and internal varlen block-sparse replay
+- Added shared native probe setup in `scripts/_native_probe_setup.py`:
+  - native probe scripts now install the runtime/shim paths consistently
+  - native probe scripts now auto-ensure the external FA4 patch before import or execution
+  - the probe flow no longer relies on remembering to run the patch step manually first
 - Expanded `scripts/validate_fa4_windows_shim.py`:
   - added broader validator coverage for varlen paged-KV forward/backward parity
   - added broader validator coverage for combined varlen `softcap + score_mod` forward/backward parity
@@ -57,20 +67,24 @@
 
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_cutlass_runtime.py`
   - `raw_cutlass_spec` now resolves to `cutlass_runtime/src/cutlass/__init__.py`
+  - `raw_cuda_spec` now resolves to `runtime_compat/src/cuda/__init__.py`
   - `cutlass_probe_mode=runtime-local-core`
   - `cute_file` now resolves to `cutlass_runtime/src/cutlass/cute/__init__.py`
   - `cute_compile_bridge_file` now resolves to `cutlass_runtime/src/cutlass/cute/_compile_bridge.py`
   - `runtime_cuda_file` now resolves to `cutlass_runtime/src/cutlass/base_dsl/runtime/cuda.py`
   - `pycute_loaded=False`
+  - `cutlass_shim_module_count=0`
   - `modern_runtime_ready=True`
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_import.py`
   - `native_import=ok`
   - `cutlass_cute_file` resolves to `cutlass_runtime/src/cutlass/cute/__init__.py`
   - `pycute_loaded=False`
+  - `cutlass_shim_module_count=0`
 - `.\.venv_fa4\Scripts\python.exe scripts\patch_flash_attn_sm120_backward.py ..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
   - `already patched`
   - `verification=ok`
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_forward.py`
+  - `patched_interface=..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
   - `varlen_paged_kv_out_max_diff=0.0`
   - `varlen_paged_kv_lse_max_diff=0.0`
   - `varlen_softcap_score_mod_out_max_diff=0.0`
@@ -78,9 +92,13 @@
   - `varlen_block_sparse_internal_out_max_diff=0.0`
   - `varlen_block_sparse_internal_lse_max_diff=0.0`
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_backward.py`
+  - `patched_interface=..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
   - `varlen_paged_kv_grad_max_diff=0.0`
   - `varlen_softcap_score_mod_grad_max_diff=0.0`
   - `varlen_block_sparse_internal_grad_max_diff=0.0`
+- `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_combine.py`
+  - `patched_interface=..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
+  - all tested combine parity cases remain exact
 - `.\.venv_fa4\Scripts\python.exe scripts\validate_fa4_windows_shim.py`
   - `validation=ok`
   - `varlen_paged_kv_out_max_diff=0.0`
@@ -91,16 +109,18 @@
 ### What is still honestly missing
 
 - The environment is still not a true Windows-native CuTe/CUTLASS DSL runtime.
-- The root package, the top-level `cutlass.cute` package, the heavy compile bridge, and the `base_dsl.runtime.cuda` loader path are now local, but other deeper subpackages still resolve through repo-local probe modules rather than a standalone compiled Windows CUTLASS DSL runtime.
+- The root package, the top-level `cutlass.cute` package, the heavy compile bridge, the `base_dsl.runtime.cuda` loader path, and the currently imported `cutlass_dsl` / `pipeline` / `utils` / `_mlir` surfaces are now local.
+- The remaining blocker is no longer active `cutlass.*` leakage from `native_probe_shims`; it is that `cutlass.cute.compile` still resolves recognized kernels to repo-local bridge objects instead of a true compiled Windows CuTe/CUTLASS DSL backend.
 - The current probe mode is now `runtime-local-core`, which is better than `runtime-wrapper+legacy-core` but still not a true native compiler/runtime.
 - The live upstream file being patched is outside this repo tree:
   - `..\third_party\flash-attention-for-windows\flash_attn\cute\interface.py`
   - the reproducible source of truth for that edit remains `scripts/patch_flash_attn_sm120_backward.py`
+  - the native probe scripts now auto-ensure that patch, so the dependency is explicit and reproducible instead of manual
 
 ### Next sensible targets
 
-- Internalize more of the deeper runtime/compiler surface into `cutlass_runtime/src` beyond the bridge and CUDA loader path, so fewer imports fall through to `native_probe_shims/`.
 - Keep the patch script as the single source of truth for the external `interface.py` edits and re-run its verification after each upstream refresh.
+- If we want to eliminate the external live patch entirely, vendor or wrap the needed FA4 interface layer inside this repo instead of relying on `..\third_party\flash-attention-for-windows\...`.
 - Extend validator/probe coverage only when new FA4 surface area is actually added.
 - Keep pushing the real blocker:
-  - replacing `runtime-local-core` plus repo-local probe subpackages with a genuine Windows CuTe/CUTLASS DSL runtime/compiler path.
+  - replacing `runtime-local-core` plus repo-local bridge objects with a genuine Windows CuTe/CUTLASS DSL runtime/compiler path.

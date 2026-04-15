@@ -19,7 +19,7 @@ from _probe_helpers import ProbePlaceholder, try_dist_version
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _PACKAGE_DIR.parents[2]
 _NATIVE_PROBE_CUTLASS_DIR = _REPO_ROOT / "native_probe_shims" / "cutlass"
-_CUDA_SHIM_INIT = _REPO_ROOT / "native_probe_shims" / "cuda" / "__init__.py"
+_CUDA_COMPAT_INIT = _REPO_ROOT / "runtime_compat" / "src" / "cuda" / "__init__.py"
 
 __path__ = [str(_PACKAGE_DIR), str(_NATIVE_PROBE_CUTLASS_DIR)]  # type: ignore[assignment]
 
@@ -28,13 +28,21 @@ def _ensure_probe_cuda_shim_loaded() -> None:
     cuda_mod = sys.modules.get("cuda")
     if cuda_mod is not None and hasattr(cuda_mod, "__version__"):
         return
+
+    try:
+        cuda_mod = importlib.import_module("cuda")
+    except Exception:
+        cuda_mod = None
+    if cuda_mod is not None and hasattr(cuda_mod, "__version__"):
+        return
+
     spec = importlib.util.spec_from_file_location(
         "cuda",
-        _CUDA_SHIM_INIT,
-        submodule_search_locations=[str(_CUDA_SHIM_INIT.parent)],
+        _CUDA_COMPAT_INIT,
+        submodule_search_locations=[str(_CUDA_COMPAT_INIT.parent)],
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load native probe cuda shim from {_CUDA_SHIM_INIT}")
+        raise RuntimeError(f"Unable to load runtime_compat cuda shim from {_CUDA_COMPAT_INIT}")
     module = importlib.util.module_from_spec(spec)
     sys.modules["cuda"] = module
     spec.loader.exec_module(module)
@@ -44,14 +52,37 @@ _ensure_probe_cuda_shim_loaded()
 
 NATIVE_PROBE_MODE = "runtime-local-core"
 NATIVE_PROBE_CUTLASS_INIT = str(Path(__file__).resolve())
+NATIVE_PROBE_RUNTIME_OWNED_MODULES = (
+    "cutlass",
+    "cutlass.base_dsl",
+    "cutlass.base_dsl.runtime.cuda",
+    "cutlass.cute",
+    "cutlass.cute._compile_bridge",
+    "cutlass.cutlass_dsl",
+    "cutlass.pipeline",
+    "cutlass.utils",
+    "cutlass.utils.blackwell_helpers",
+    "cutlass.utils.hopper_helpers",
+    "cutlass.utils.blockscaled_layout",
+    "cutlass._mlir",
+    "cutlass._mlir.ir",
+    "cutlass._mlir.dialects",
+    "cutlass._mlir.dialects.arith",
+    "cutlass._mlir.dialects.cute_nvgpu",
+    "cutlass._mlir.dialects.llvm",
+    "cutlass._mlir.dialects.nvvm",
+    "cutlass._mlir.dialects.vector",
+)
+NATIVE_PROBE_FALLBACK_ROOTS = (str(_NATIVE_PROBE_CUTLASS_DIR),)
 NATIVE_PROBE_DIST_VERSIONS = {
     "cutlass": try_dist_version("cutlass"),
     "nvidia-cutlass-dsl": try_dist_version("nvidia-cutlass-dsl"),
 }
 NATIVE_PROBE_REASON = (
-    "Using the repo-local cutlass_runtime root package instead of the legacy "
-    "editable CUTLASS root. Subpackages still resolve through the repo-local "
-    "Windows probe modules."
+    "Using the repo-local cutlass_runtime root package and runtime-owned "
+    "CUTLASS compatibility subpackages instead of the legacy editable "
+    "CUTLASS root. The native_probe_shims tree remains only as a fallback "
+    "for unimplemented modules."
 )
 
 
@@ -189,6 +220,8 @@ __all__ = [
     "_mlir",
     "NATIVE_PROBE_MODE",
     "NATIVE_PROBE_CUTLASS_INIT",
+    "NATIVE_PROBE_RUNTIME_OWNED_MODULES",
+    "NATIVE_PROBE_FALLBACK_ROOTS",
     "NATIVE_PROBE_DIST_VERSIONS",
     "NATIVE_PROBE_REASON",
 ]
