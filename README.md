@@ -25,7 +25,11 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 - `scripts/smoke_test_flash_attn.py`: import and CUDA execution smoke test
 - `scripts/test_fa4_windows_shim.py`: probes the repo-local FA4 import shim and can run a tiny CUDA forward smoke test
 - `scripts/validate_fa4_windows_shim.py`: broader validation matrix for the Windows FA4 shim
+- `scripts/probe_cutlass_runtime.py`: reports which CUTLASS runtime the native FA4 probe is actually using and why
+- `scripts/probe_native_fa4_import.py`: isolated native-path import probe using compatibility shims instead of the stable fallback
+- `scripts/probe_native_fa4_forward.py`: tiny native-path CUDA forward probe plus SDPA sanity check
 - `shims/`: repo-local compatibility shims used only for FA4 Windows probing
+- `native_probe_shims/`: isolated import/runtime scaffolding that pushes the native FA4 path farther without touching the stable fallback
 - `patches/*.patch`: reference diffs for the two required source edits
 
 ## What This Does Not Do
@@ -54,8 +58,14 @@ Current status:
 - validation now also covers varlen `seqused_q` plus the mixed packed/padded layout paths
 - validation now also covers `info`-named seqlen modifier signatures in addition to `seqlen_info`
 - the shim passes the broader validation matrix in `scripts/validate_fa4_windows_shim.py`
+- the native probe now auto-prefers a real modern CUTLASS package if one ever becomes importable in this env
+- the isolated native probe path now imports `flash_attn.cute` successfully under `native_probe_shims/`
+- the native probe now replaces recognized FA4 forward-kernel `cute.compile(...)` calls with a real Windows bridge object
+- the tiny native-path CUDA forward probe now reaches numerically sane dense output through that bridge, with close parity versus SDPA even when LSE is requested
+- the compiled cache entry for that path is now `NativeProbeForwardBridge`, not a dead placeholder
+- the CUTLASS runtime probe currently shows `nvidia-cutlass-dsl` metadata is installed, but no separate modern CUTLASS runtime package is importable on this Windows env, so the probe still falls back to the legacy editable CUTLASS tree plus compatibility shims
 
-The root native blocker is now pinned down more precisely than just "missing wheels". In `.venv_fa4`, the editable CUTLASS Python tree is present, but a plain import still fails because CUTLASS expects the older top-level CUDA Python API shape (`from cuda import __version__, cuda, cudart, nvrtc`) while the installed `cuda-python==13.2.0` exposes modules under `cuda.bindings.*`. Even after an in-memory compatibility patch makes `import cutlass` succeed, the linked tree still does not contain `cutlass.cute`, which is the module `flash_attn.cute` needs. The current stable path is therefore a Windows compatibility shim, not a native FA4 kernel path.
+The root native blocker is now pinned down more precisely than just "missing wheels". In `.venv_fa4`, the editable CUTLASS Python tree is present, but the newer FA4 stack expects a much larger CUTLASS DSL surface than that tree provides. The isolated `native_probe_shims/` layer now bridges enough of the CUDA API shape, CUTLASS package shape, CuTe module tree, MLIR dialects, pipeline classes, and Unix-only `fcntl` import to make the real `flash_attn.cute` import succeed. It also now intercepts recognized FA4 forward-kernel `cute.compile(...)` calls and returns a real `NativeProbeForwardBridge` object that routes execution onto the validated Windows shim path, producing numerically sane dense outputs and LSE tensors with close parity versus SDPA in the probe. The new runtime probe still shows why this is not native CuTe codegen yet: `nvidia-cutlass-dsl` is installed only as the top-level distribution metadata here, while the separate CUTLASS DSL runtime packages FA4 expects are not importable for this Windows env, so the probe must still fall back to the legacy editable CUTLASS tree plus compatibility shims. The current stable path is therefore still the Windows compatibility shim and selective bridge objects, not a true native FA4 kernel path.
 
 See `docs/FA4_WINDOWS_STATUS.md` for the exact attempted install path and blocker.
 

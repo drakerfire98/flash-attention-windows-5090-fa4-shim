@@ -32,6 +32,12 @@ These installed in the isolated FA4 env:
 - `nvidia-cutlass-dsl==4.4.2 --no-deps`
 - editable install of `flash-attn-4` from `third_party/flash-attention-for-windows/flash_attn/cute`
 
+Important packaging note:
+
+- `nvidia-cutlass-dsl` is present as the top-level Python distribution metadata in this env
+- but the separate runtime packages it declares, such as `nvidia-cutlass-dsl-libs-base==4.4.2`, are not importable on this Windows stack
+- querying PyPI from the isolated env for `nvidia-cutlass-dsl-libs-base` and `nvidia-cutlass-dsl-libs-cu13` returned `No matching distribution found`
+
 ## What Fails In A Clean Import
 
 The first real FA4 import still failed:
@@ -174,6 +180,62 @@ Varlen note:
 
 So the shim is now good for a stable Windows fallback on the public FA4 entrypoints we implemented, but it is still **not** proof of a native CuTe/CUTLASS FA4 kernel path on Windows.
 
+## Native Probe Progress
+
+A second, isolated probe path now exists under:
+
+- `native_probe_shims/`
+- `scripts/probe_cutlass_runtime.py`
+- `scripts/probe_native_fa4_import.py`
+- `scripts/probe_native_fa4_forward.py`
+
+This path is separate from the stable fallback shim under `shims/`. Its only job is to push the
+real native `flash_attn.cute` import/runtime chain forward far enough to reveal the next honest
+blocker without pretending the backend is fully implemented.
+
+Current probe result:
+
+- `scripts/probe_cutlass_runtime.py` now reports which CUTLASS package the native probe actually selected
+- the probe now auto-prefers a real modern CUTLASS package if one ever becomes importable on this machine
+- on the current Windows env, no such modern package is importable, so the probe still falls back to the legacy editable CUTLASS tree plus compatibility shims
+- `scripts/probe_native_fa4_import.py` now imports the real upstream `flash_attn.cute` package successfully
+- this requires compatibility scaffolding for:
+  - the old top-level CUDA Python API shape
+  - the missing `cutlass.cute` package tree
+  - newer CUTLASS DSL-side package/modules expected by FA4 and `quack`
+  - Unix-only `fcntl`
+- `scripts/probe_native_fa4_forward.py` now reaches a tiny CUDA forward call through that native path
+- recognized FA4 forward-kernel `cute.compile(...)` calls now return a real `NativeProbeForwardBridge` object instead of a dead placeholder
+- that bridge routes execution onto the validated Windows shim path for the forward kernel family we currently recognize
+
+This is more real than the earlier placeholder probe, but it is still not native CuTe codegen yet.
+
+Observed probe output with `return_lse=True`:
+
+- output device: `cuda:0`
+- output dtype: `torch.bfloat16`
+- output stayed finite
+- output max diff vs SDPA: `0.0078125`
+- output mean diff vs SDPA: about `3.0e-4`
+- output sum: about `134.25`
+- SDPA reference sum: about `134.21`
+- LSE type: `Tensor`
+- compiled kernel cache entry type: `NativeProbeForwardBridge`
+- compiled kernel cache entry repr: `<NativeProbeForwardBridge FlashAttentionForwardSm120>`
+- CUTLASS probe mode: `legacy-editable-cutlass`
+- CUTLASS probe reason: `nvidia-cutlass-dsl` is installed, but no separate modern importable CUTLASS package files are available on this Windows env
+
+That means the main forward path is no longer blocked by a dead placeholder for this recognized
+kernel family. The next real missing piece is still a usable CuTe DSL compiler/runtime
+implementation behind:
+
+- `cutlass.cute.compile`
+- related runtime / cubin load hooks
+
+Until that exists for this Windows stack, the native probe can import and traverse the FA4 code
+path and selectively bridge known forward kernels, but it still will not be a true native FA4
+kernel implementation.
+
 ## Practical Meaning
 
 At the moment this repo contains:
@@ -193,5 +255,7 @@ The next promising route is one of:
 
 1. Build or locate a Windows CUDA compatibility layer that exposes the old `from cuda import __version__, cuda, cudart, nvrtc` surface cleanly.
 2. Build or locate a CUTLASS Python package that actually provides `cutlass.cute` on Windows, not just the adjacent CUTLASS / pycute trees.
-3. Extend the shim only when more FA4 surface area is actually needed, keeping unsupported features explicit instead of silently approximated.
-4. Re-test native FA4 when upstream or community Windows packaging for the CUTLASS DSL layer matures.
+3. Build or locate the real CuTe DSL compiler/runtime layer so `cutlass.cute.compile` and its runtime hooks stop resolving to probe placeholders.
+4. If Windows wheels do not materialize, build the missing CUTLASS DSL runtime from source or vendor the required pieces into a separate Windows-focused bridge layer.
+5. Extend the shim only when more FA4 surface area is actually needed, keeping unsupported features explicit instead of silently approximated.
+6. Re-test native FA4 when upstream or community Windows packaging for the CUTLASS DSL layer matures.
