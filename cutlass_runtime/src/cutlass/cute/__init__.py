@@ -16,7 +16,7 @@ _REPO_ROOT = _PACKAGE_DIR.parents[4]
 __path__ = [str(_PACKAGE_DIR)]  # type: ignore[assignment]
 
 from _probe_helpers import ProbePlaceholder, module_getattr, passthrough_decorator
-from ._compile_bridge import compile_dispatch
+from ._compile_bridge import NativeRuntimeCompiler, compile_dispatch
 from ._pycute_compat import (
     ComposedLayout,
     Layout,
@@ -54,7 +54,7 @@ class _MathCompat:
 
 jit = passthrough_decorator
 kernel = passthrough_decorator
-compile = compile_dispatch
+compile = NativeRuntimeCompiler()
 sym_int = runtime.sym_int
 sym_int64 = runtime.sym_int64
 math = _MathCompat()

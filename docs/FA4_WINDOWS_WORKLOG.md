@@ -170,6 +170,16 @@
   - `varlen_paged_kv_dq_max_diff=0.0`
   - `varlen_softcap_score_mod_out_max_diff=0.0`
   - `varlen_softcap_score_mod_dq_max_diff=0.0`
+- `.\.venv_fa4\Scripts\python.exe scripts\probe_cutlass_runtime.py`
+  - `cute_compile_type=NativePatchedRuntimeCompiler`
+  - `cute_compile_repr=<NativePatchedRuntimeCompiler runtime=runtime-local-owned surface=plan-backed cubin-dump-patch=enabled>`
+- `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_forward.py`
+  - the compile cache now holds `NativeCompiledPlan` entries instead of raw bridge objects
+  - the sample repr now exposes modifier-family and native-support metadata
+  - exact-with-LSE parity remains intact for the seeded forward probe set
+  - out-only additive-bias proof cases now show compiled native score-bias slices:
+    - dense: `native_dense_backend_status()['last_call'] == 'extra_score_bias'`
+    - varlen: `native_varlen_backend_status()['last_call'] == 'packed_q+packed_k+extra_score_bias'`
 
 ### What is still honestly missing
 

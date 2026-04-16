@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import torch
 
@@ -39,6 +40,73 @@ _DLSE_BY_DQACCUM: dict[int, torch.Tensor | None] = {}
 _POSTPROCESS_RESULTS: dict[int, torch.Tensor] = {}
 _FWD_METADATA_BY_TENSOR_PTR: dict[int, dict[str, Any]] = {}
 _BWD_METADATA_BY_DQACCUM: dict[int, dict[str, Any]] = {}
+
+
+@dataclass(frozen=True)
+class NativePlanSpec:
+    family: str
+    op_name: str
+    runtime_mode: str
+    backend_summary: str
+    modifier_family: str
+    native_support: str
+    compile_surface: str = "cutlass.cute.compile"
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "family": self.family,
+            "op_name": self.op_name,
+            "runtime_mode": self.runtime_mode,
+            "backend_summary": self.backend_summary,
+            "modifier_family": self.modifier_family,
+            "native_support": self.native_support,
+            "compile_surface": self.compile_surface,
+        }
+
+
+class NativeCompiledPlan(JitCompiledFunction):
+    def __init__(self, spec: NativePlanSpec, executor: Callable[..., Any]):
+        self.spec = spec
+        self._executor = executor
+
+    def __call__(self, *args, **kwargs):
+        return self._executor(*args, **kwargs)
+
+    def __repr__(self) -> str:
+        return (
+            f"<NativeCompiledPlan family={self.spec.family} op={self.spec.op_name} "
+            f"modifier={self.spec.modifier_family} support={self.spec.native_support} "
+            f"runtime={self.spec.runtime_mode} backend={self.spec.backend_summary}>"
+        )
+
+    def export_to_c(self, *args, **kwargs):
+        del args, kwargs
+        return self.spec.as_dict()
+
+
+class NativeRuntimeCompiler:
+    def __call__(self, op: Any, *args, **kwargs):
+        return compile_dispatch(op, *args, **kwargs)
+
+    def __repr__(self) -> str:
+        return (
+            "<NativeRuntimeCompiler runtime=runtime-local-owned "
+            "surface=plan-backed hybrid=compiled-slices+runtime-executors>"
+        )
+
+
+class NativePatchedRuntimeCompiler(NativeRuntimeCompiler):
+    def __init__(self, patched_compile: Callable[..., Any]):
+        self._patched_compile = patched_compile
+
+    def __call__(self, op: Any, *args, **kwargs):
+        return self._patched_compile(op, *args, **kwargs)
+
+    def __repr__(self) -> str:
+        return (
+            "<NativePatchedRuntimeCompiler runtime=runtime-local-owned "
+            "surface=plan-backed cubin-dump-patch=enabled>"
+        )
 def _copy_tensor_like(dst: torch.Tensor | None, src: torch.Tensor | None) -> None:
     if dst is None or src is None:
         return
@@ -250,6 +318,7 @@ def _run_forward_with_bridge_runtime(
     is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table))
     causal = bool(getattr(kernel, "is_causal", False))
     block_size = block_size_override or _resolve_bridge_block_size(kernel, q, k, block_sparse_tensors)
+    structured_score_bias = None
 
     if score_mod is None and (mask_mod is not None or block_sparse_tensors is not None):
         if is_varlen:
@@ -360,6 +429,75 @@ def _run_forward_with_bridge_runtime(
                 return_lse=return_lse,
             )
             return shim_out, shim_lse, block_size
+
+    if score_mod is not None and mask_mod is None and block_sparse_tensors is None:
+        if is_varlen:
+            structured_score_bias = materialize_varlen_score_bias(
+                q,
+                k,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                page_table=page_table,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+            )
+        else:
+            structured_score_bias = materialize_dense_score_bias(
+                q,
+                k,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+                batch_start_index=0,
+                offset_q=0,
+                offset_k=0,
+            )
+
+    if structured_score_bias is not None and not return_lse and float(softcap) == 0.0:
+        if is_varlen:
+            try:
+                return (
+                    *flash_attn_varlen_forward_native(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        seqused_q=seqused_q,
+                        seqused_k=seqused_k,
+                        page_table=page_table,
+                        softmax_scale=softmax_scale,
+                        causal=causal,
+                        window_size=window_size,
+                        learnable_sink=learnable_sink,
+                        extra_score_bias=structured_score_bias,
+                        softcap=softcap,
+                        return_lse=return_lse,
+                    ),
+                    block_size,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                return (
+                    *flash_attn_dense_forward_native(
+                        q,
+                        k,
+                        v,
+                        softmax_scale=softmax_scale,
+                        causal=causal,
+                        window_size=window_size,
+                        learnable_sink=learnable_sink,
+                        extra_score_bias=structured_score_bias,
+                        softcap=softcap,
+                        return_lse=return_lse,
+                    ),
+                    block_size,
+                )
+            except Exception:
+                pass
 
     if _can_use_native_varlen_backend(
         is_varlen=is_varlen,
@@ -1139,23 +1277,134 @@ class NativeProbeUnsupportedBridge(JitCompiledFunction):
         raise NotImplementedError(f"Native probe compile bridge does not yet implement {self.op_name}")
 
 
-def compile_dispatch(op: Any, *args, **kwargs):
+def _plan_backend_summary(op_name: str) -> str:
+    if op_name.startswith("FlashAttentionForwardSm"):
+        dense_status = native_dense_backend_status()
+        varlen_status = native_varlen_backend_status()
+        dense_backend = "compiled" if dense_status.get("built") else "fallback"
+        varlen_backend = "compiled" if varlen_status.get("built") else "fallback"
+        return f"dense={dense_backend},varlen={varlen_backend},runtime=owned"
+    if op_name.startswith("FlashAttentionBackwardSm"):
+        dense_status = native_dense_bwd_backend_status()
+        varlen_status = native_varlen_bwd_backend_status()
+        dense_backend = "compiled" if dense_status.get("built") else "fallback"
+        varlen_backend = "compiled" if varlen_status.get("built") else "fallback"
+        return f"dense_bwd={dense_backend},varlen_bwd={varlen_backend},runtime=owned"
+    if op_name == "FlashAttentionForwardCombine":
+        combine_status = native_combine_backend_status()
+        combine_backend = "compiled" if combine_status.get("built") else "fallback"
+        return f"combine={combine_backend}"
+    if op_name in {"FlashAttentionBackwardPreprocess", "FlashAttentionBackwardPostprocess"}:
+        helpers_status = native_bwd_helpers_backend_status()
+        helpers_backend = "compiled" if helpers_status.get("built") else "fallback"
+        return f"helpers={helpers_backend}"
+    if op_name == "BlockSparsityKernel":
+        return "runtime=owned"
+    return "unsupported"
+
+
+def _plan_modifier_family(op: Any) -> str:
+    op_name = type(op).__name__
+    if op_name == "FlashAttentionForwardCombine":
+        return "combine"
+    if op_name in {"FlashAttentionBackwardPreprocess", "FlashAttentionBackwardPostprocess"}:
+        return "helper"
+    if op_name == "BlockSparsityKernel":
+        return "block-sparsity"
+
+    mask_mod = getattr(op, "mask_mod", None)
+    if mask_mod is not None:
+        return "keep-mask"
+
+    score_mod = getattr(op, "score_mod", None)
+    if score_mod is not None:
+        softcap, nested_score_mod = _extract_softcap_score_mod_components(score_mod)
+        if softcap is not None and nested_score_mod is not None:
+            return "softcap+score-bias"
+        if softcap is not None:
+            return "softcap"
+        return "score-bias"
+
+    if getattr(op, "score_mod_bwd", None) is not None:
+        return "score-mod-bwd"
+    if bool(getattr(op, "is_local", False)):
+        return "local-window"
+    if int(getattr(op, "qhead_per_kvhead", 1) or 1) > 1:
+        return "gqa-reduction"
+    return "plain"
+
+
+def _plan_native_support(op: Any) -> str:
+    op_name = type(op).__name__
+    modifier_family = _plan_modifier_family(op)
+    if op_name == "FlashAttentionForwardCombine":
+        return "compiled"
+    if op_name in {"FlashAttentionBackwardPreprocess", "FlashAttentionBackwardPostprocess"}:
+        return "compiled"
+    if op_name == "BlockSparsityKernel":
+        return "runtime-owned"
+    if op_name.startswith("FlashAttentionForwardSm"):
+        if modifier_family in {"plain", "local-window", "softcap", "gqa-reduction"}:
+            return "compiled-candidate"
+        if modifier_family == "keep-mask":
+            return "compiled-keep-mask-candidate"
+        if modifier_family == "score-bias":
+            return "compiled-score-bias-candidate"
+        if modifier_family == "softcap+score-bias":
+            return "out-only-compiled-score-bias-candidate"
+        return "runtime-replay"
+    if op_name.startswith("FlashAttentionBackwardSm"):
+        if modifier_family in {"plain", "local-window", "gqa-reduction"}:
+            return "compiled-candidate"
+        if modifier_family == "keep-mask":
+            return "compiled-keep-mask-candidate"
+        if modifier_family == "score-bias":
+            return "compiled-score-bias-candidate"
+        if modifier_family == "softcap+score-bias":
+            return "runtime-replay"
+        return "runtime-replay"
+    return "unsupported"
+
+
+def _build_native_plan(op: Any, *args, **kwargs) -> NativeCompiledPlan:
     del args, kwargs
     op_name = type(op).__name__
+    family = "unsupported"
+    executor: Callable[..., Any]
     if op_name.startswith("FlashAttentionForwardSm"):
-        return NativeProbeForwardBridge(op)
-    if op_name == "FlashAttentionForwardCombine":
-        return NativeCompiledForwardCombineBridge()
-    if op_name == "BlockSparsityKernel":
-        return NativeProbeBlockSparsityBridge(op)
-    if op_name == "FlashAttentionBackwardPreprocess":
-        return NativeProbeBackwardPreprocessBridge()
-    if op_name == "FlashAttentionBackwardPostprocess":
-        return NativeProbeBackwardPostprocessBridge()
-    if op_name.startswith("FlashAttentionBackwardSm"):
-        return NativeProbeBackwardBridge(op)
-    return NativeProbeUnsupportedBridge(op)
+        family = "flash_attn_forward"
+        executor = NativeProbeForwardBridge(op)
+    elif op_name == "FlashAttentionForwardCombine":
+        family = "flash_attn_forward_combine"
+        executor = NativeCompiledForwardCombineBridge()
+    elif op_name == "BlockSparsityKernel":
+        family = "block_sparsity"
+        executor = NativeProbeBlockSparsityBridge(op)
+    elif op_name == "FlashAttentionBackwardPreprocess":
+        family = "flash_attn_backward_preprocess"
+        executor = NativeProbeBackwardPreprocessBridge()
+    elif op_name == "FlashAttentionBackwardPostprocess":
+        family = "flash_attn_backward_postprocess"
+        executor = NativeProbeBackwardPostprocessBridge()
+    elif op_name.startswith("FlashAttentionBackwardSm"):
+        family = "flash_attn_backward"
+        executor = NativeProbeBackwardBridge(op)
+    else:
+        executor = NativeProbeUnsupportedBridge(op)
+    spec = NativePlanSpec(
+        family=family,
+        op_name=op_name,
+        runtime_mode="runtime-local-owned",
+        backend_summary=_plan_backend_summary(op_name),
+        modifier_family=_plan_modifier_family(op),
+        native_support=_plan_native_support(op),
+    )
+    return NativeCompiledPlan(spec, executor)
 
 
-def compile_repr() -> ProbePlaceholder:
-    return ProbePlaceholder("cutlass.cute.compile")
+def compile_dispatch(op: Any, *args, **kwargs):
+    return _build_native_plan(op, *args, **kwargs)
+
+
+def compile_repr() -> NativeRuntimeCompiler:
+    return NativeRuntimeCompiler()

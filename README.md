@@ -84,7 +84,7 @@ Current status:
 - the plain batched dense forward family now also has a repo-built Windows extension module (`fa4_windows_native_dense_ext.cp313-win_amd64.pyd`), and the native forward probe now reports `dense_backend=compiled`
 - the same dense compiled backend now also covers the tested local-window and `learnable_sink` dense cases exactly, while dense `softcap` now routes through the exact repo-local runtime path instead of the compiled slice
 - the plain varlen forward family now also has a repo-built Windows extension module (`fa4_win_varlen_ext.cp313-win_amd64.pyd`), and the native probes now report `varlen_backend=compiled`
-- that compiled varlen backend now covers the tested mixed padded/packed layouts, `seqused_q` / `seqused_k`, and paged-KV no-modifier cases exactly against the stable Windows shim, while plain varlen `softcap` is currently near-exact
+- that compiled varlen backend now covers the tested mixed padded/packed layouts, `seqused_q` / `seqused_k`, and paged-KV no-modifier cases exactly against the stable Windows shim, while plain varlen `softcap` remains exact through the exact runtime-owned path when LSE parity matters
 - the dense backward replay path now also reuses that compiled dense backend for the same plain family before falling back to the validated shim path
 - the broader dense backward family now also has a repo-built Windows extension module (`fa4_win_dbwd_ext.cp313-win_amd64.pyd`), covering the tested dense plain, local-window, `learnable_sink`, and keep-mask-based backward cases through a compiled slice
 - the varlen backward replay path now also reuses that compiled varlen backend for the same no-modifier family before falling back to the validated shim path
@@ -100,14 +100,16 @@ Current status:
   - dense `learnable_sink` forward and backward parity are exact against the stable Windows shim
   - dense `mask_mod` forward and backward parity are exact against the stable Windows shim
   - dense `score_mod` forward parity is exact against the stable Windows shim
+  - dense additive `score_mod` also has an out-only compiled native slice, with `native_dense_backend_status()['last_call'] == 'extra_score_bias'`
   - dense block-sparse forward and backward parity are exact against the stable Windows shim through the public SM120 wrapper path
-  - varlen `softcap` forward parity is near-exact against the stable Windows shim
+  - varlen `softcap` forward parity is exact against the stable Windows shim
   - varlen `seqused_q` / `seqused_k` forward and backward parity are exact against the stable Windows shim
   - varlen `score_mod` forward parity is exact against the stable Windows shim
+  - varlen additive `score_mod` also has an out-only compiled native slice, with `native_varlen_backend_status()['last_call'] == 'packed_q+packed_k+extra_score_bias'`
   - varlen `seqused_q` / `seqused_k` plus `score_mod` backward parity is exact against the stable Windows shim
   - varlen paged-KV backward parity is exact against the stable Windows shim
   - internal varlen block-sparse backward parity is exact against the stable Windows shim
-- the compiled cache entry for that path is now `NativeProbeForwardBridge`, not a dead placeholder
+- the compiled cache entry for that path is now a plan-backed `NativeCompiledPlan`, not a dead placeholder, and its repr now exposes modifier-family plus native-support metadata
 - the CUTLASS runtime probe now shows that raw `cutlass`, raw `cuda`, and raw `nvidia_cutlass_dsl` imports all succeed from repo-local Windows wrapper packages
 - the native probe cubin loader now also succeeds end-to-end through `cutlass_runtime/src/cutlass/base_dsl/runtime/cuda.py` using `cudaLibraryLoadData`, `cudaLibraryGetKernel`, and `cudaLibraryUnload`
 - a small installable compat package now exists under `runtime_compat/`; once installed into `.venv_fa4`, the raw Windows import surface improves to:

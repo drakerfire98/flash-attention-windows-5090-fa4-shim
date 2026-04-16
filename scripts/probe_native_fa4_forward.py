@@ -264,6 +264,38 @@ def _run_dense_score_mod(iface, shim_mod):
     _print_case_metrics("dense_score_mod", native_out, ref_out, native_lse, ref_lse)
 
 
+def _run_dense_score_mod_out_only_native_slice(iface, shim_mod):
+    from cutlass.cute._native_dense_backend import native_dense_backend_status
+
+    torch.manual_seed(127)
+    q = torch.randn(1, 18, 2, 32, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 18, 2, 32, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 18, 2, 32, device="cuda", dtype=torch.bfloat16)
+    native_out, native_lse = iface._flash_attn_fwd(
+        q, k, v, causal=True, return_lse=False, score_mod=_dense_score_mod
+    )
+    ref_out, ref_lse = shim_mod._attention_forward_dense(
+        q,
+        k,
+        v,
+        softmax_scale=None,
+        causal=True,
+        window_size=(None, None),
+        learnable_sink=None,
+        softcap=0.0,
+        score_mod=_dense_score_mod,
+        mask_mod=None,
+        aux_tensors=None,
+        batch_start_index=0,
+        offset_q=0,
+        offset_k=0,
+        extra_keep_mask=None,
+        return_lse=False,
+    )
+    _print_case_metrics("dense_score_mod_out_only", native_out, ref_out, native_lse, ref_lse)
+    print(f"dense_score_mod_out_only_native_backend={native_dense_backend_status()}")
+
+
 def _run_dense_block_sparse(native_flash_attn_func, shim_mod):
     torch.manual_seed(41)
     q = torch.randn(1, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
@@ -454,6 +486,48 @@ def _run_varlen_softcap_score_mod(native_flash_attn_varlen_func, shim_mod):
     )
 
 
+def _run_varlen_score_mod_out_only_native_slice(native_flash_attn_varlen_func, shim_mod):
+    from cutlass.cute._native_varlen_backend import native_varlen_backend_status
+
+    torch.manual_seed(149)
+    lengths_q = [4, 5]
+    lengths_k = [5, 6]
+    q = torch.randn(sum(lengths_q), 2, 16, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lengths_k), 2, 16, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(sum(lengths_k), 2, 16, device="cuda", dtype=torch.bfloat16)
+    cu_q = torch.tensor([0, lengths_q[0], sum(lengths_q)], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, lengths_k[0], sum(lengths_k)], device="cuda", dtype=torch.int32)
+
+    native_out, native_lse = native_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        causal=True,
+        score_mod=_varlen_score_mod,
+        return_lse=False,
+    )
+    ref_out, ref_lse = shim_mod.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        causal=True,
+        score_mod=_varlen_score_mod,
+        return_lse=False,
+    )
+    _print_case_metrics(
+        "varlen_score_mod_out_only",
+        native_out,
+        ref_out,
+        native_lse,
+        ref_lse,
+    )
+    print(f"varlen_score_mod_out_only_native_backend={native_varlen_backend_status()}")
+
+
 def _run_varlen_block_sparse_internal(iface, shim_mod):
     torch.manual_seed(53)
     q = torch.randn(2, 256, 1, 32, device="cuda", dtype=torch.bfloat16)
@@ -595,6 +669,7 @@ def main() -> int:
         lambda: _run_dense_window(flash_attn_func, shim_mod),
         lambda: _run_dense_mask_mod(flash_attn_func, shim_mod),
         lambda: _run_dense_score_mod(iface, shim_mod),
+        lambda: _run_dense_score_mod_out_only_native_slice(iface, shim_mod),
         lambda: _run_dense_block_sparse(flash_attn_func, shim_mod),
         lambda: _run_varlen_softcap(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_seqused(flash_attn_varlen_func, shim_mod),
@@ -602,6 +677,7 @@ def main() -> int:
         lambda: _run_varlen_seqused_score_mod(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_paged_kv(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_softcap_score_mod(flash_attn_varlen_func, shim_mod),
+        lambda: _run_varlen_score_mod_out_only_native_slice(flash_attn_varlen_func, shim_mod),
         lambda: _run_varlen_block_sparse_internal(iface, shim_mod),
     ):
         _clear_compile_caches(iface)

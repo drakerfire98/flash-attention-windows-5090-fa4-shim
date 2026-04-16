@@ -6,6 +6,7 @@ from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
 
 import cutlass.cute as cute
+from cutlass.cute._compile_bridge import NativePatchedRuntimeCompiler
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _PACKAGE_DIR.parents[4]
@@ -25,7 +26,7 @@ from .interface import (
 
 from flash_attn.cute.cute_dsl_utils import cute_compile_patched
 
-cute.compile = cute_compile_patched
+cute.compile = NativePatchedRuntimeCompiler(cute_compile_patched)
 
 __all__ = [
     "flash_attn_func",

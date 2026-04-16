@@ -287,8 +287,8 @@ Observed probe output with `return_lse=True`:
 - output sum: about `134.25`
 - SDPA reference sum: about `134.21`
 - LSE type: `Tensor`
-- compiled kernel cache entry type: `NativeProbeForwardBridge`
-- compiled kernel cache entry repr: `<NativeProbeForwardBridge FlashAttentionForwardSm120 dense_backend=compiled varlen_backend=compiled>`
+- compiled kernel cache entry type: `NativeCompiledPlan`
+- compiled kernel cache entry repr: `<NativeCompiledPlan family=flash_attn_forward op=FlashAttentionForwardSm120 modifier=keep-mask support=compiled-keep-mask-candidate runtime=runtime-local-owned backend=dense=compiled,varlen=compiled,runtime=owned>`
 - CUTLASS probe mode: `runtime-local-owned`
 - CUTLASS probe reason: the repo-local `cutlass_runtime/` package now owns the top-level `cutlass` root and the currently imported CUTLASS compatibility subpackages directly; the remaining blocker is still the lack of a standalone compiled CUTLASS DSL runtime
 
@@ -319,12 +319,16 @@ Observed widened modifier probe output:
 - dense `score_mod` forward:
   - output max diff vs stable shim: `0.0`
   - LSE max diff vs stable shim: `0.0`
+  - out-only native-slice proof: `native_dense_backend_status()['last_call'] == 'extra_score_bias'`
 - dense block-sparse backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
 - varlen `softcap` forward:
   - output max diff vs stable shim: `0.0`
   - LSE max diff vs stable shim: `0.0`
+- varlen `score_mod` out-only native-slice proof:
+  - output max diff vs stable shim: `0.0`
+  - native backend last call: `packed_q+packed_k+extra_score_bias`
 - varlen `seqused_q` / `seqused_k` backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
