@@ -99,7 +99,7 @@ cutlass_probe_mode=legacy-editable-cutlass
 The probe path now imports `cutlass` through the installable runtime package first and currently reports:
 
 ```text
-cutlass_probe_mode=runtime-local-core
+cutlass_probe_mode=runtime-local-owned
 cute_file=...\cutlass_runtime\src\cutlass\cute\__init__.py
 ```
 
@@ -289,7 +289,7 @@ Observed probe output with `return_lse=True`:
 - LSE type: `Tensor`
 - compiled kernel cache entry type: `NativeProbeForwardBridge`
 - compiled kernel cache entry repr: `<NativeProbeForwardBridge FlashAttentionForwardSm120 dense_backend=compiled varlen_backend=compiled>`
-- CUTLASS probe mode: `runtime-local-core`
+- CUTLASS probe mode: `runtime-local-owned`
 - CUTLASS probe reason: the repo-local `cutlass_runtime/` package now owns the top-level `cutlass` root and the currently imported CUTLASS compatibility subpackages directly; the remaining blocker is still the lack of a standalone compiled CUTLASS DSL runtime
 
 Observed backward probe output:
@@ -302,11 +302,11 @@ Observed backward probe output:
 Observed widened modifier probe output:
 
 - dense `softcap` forward:
-  - output max diff vs stable shim: `0.0078125`
-  - LSE max diff vs stable shim: `0.0013653337955474854`
+  - output max diff vs stable shim: `0.0`
+  - LSE max diff vs stable shim: `0.0`
 - dense `softcap` backward:
-  - output max diff vs stable shim: `0.0078125`
-  - grad max diff vs stable shim: `0.00390625`
+  - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
 - dense `learnable_sink` backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
@@ -323,13 +323,16 @@ Observed widened modifier probe output:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
 - varlen `softcap` forward:
-  - output max diff vs stable shim: `3.814697265625e-06`
-  - LSE max diff vs stable shim: `1.8894672393798828e-05`
+  - output max diff vs stable shim: `0.0`
+  - LSE max diff vs stable shim: `0.0`
 - varlen `seqused_q` / `seqused_k` backward:
   - output max diff vs stable shim: `0.0`
   - grad max diff vs stable shim: `0.0`
 - varlen `seqused_q` / `seqused_k` plus `score_mod` backward:
   - output max diff vs stable shim: `0.0`
+  - grad max diff vs stable shim: `0.0`
+- targeted additive-bias varlen `score_mod` backward:
+  - native backend last call: `packed_q+packed_k+extra_score_bias+lse_grad`
   - grad max diff vs stable shim: `0.0`
 - varlen paged-KV backward:
   - output max diff vs stable shim: `0.0`

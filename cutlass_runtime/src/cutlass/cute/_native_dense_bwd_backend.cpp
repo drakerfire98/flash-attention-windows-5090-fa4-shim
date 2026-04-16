@@ -41,7 +41,8 @@ std::vector<torch::Tensor> dense_forward_outputs(
     int64_t window_right,
     double softcap,
     const c10::optional<torch::Tensor>& learnable_sink_opt,
-    const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
+    const c10::optional<torch::Tensor>& extra_keep_mask_opt,
+    const c10::optional<torch::Tensor>& extra_score_bias_opt) {
   TORCH_CHECK(q.dim() == 4, "q must be shaped (batch, seqlen_q, heads, dim)");
   TORCH_CHECK(k.dim() == 4, "k must be shaped (batch, seqlen_k, heads, dim)");
   TORCH_CHECK(v.dim() == 4, "v must be shaped (batch, seqlen_k, heads, dim_v)");
@@ -73,6 +74,19 @@ std::vector<torch::Tensor> dense_forward_outputs(
   }
 
   auto scores = torch::matmul(q_t, k_t.transpose(-1, -2)) * softmax_scale;
+  if (extra_score_bias_opt.has_value() && extra_score_bias_opt.value().defined()) {
+    auto extra_score_bias = extra_score_bias_opt.value().to(scores.device(), torch::kFloat);
+    TORCH_CHECK(
+        extra_score_bias.dim() == 4,
+        "extra_score_bias must be shaped (batch, heads, seqlen_q, seqlen_k)");
+    TORCH_CHECK(
+        extra_score_bias.size(0) == scores.size(0) &&
+            extra_score_bias.size(1) == scores.size(1) &&
+            extra_score_bias.size(2) == scores.size(2) &&
+            extra_score_bias.size(3) == scores.size(3),
+        "extra_score_bias shape must match the expanded attention score shape");
+    scores = scores + extra_score_bias;
+  }
   if (causal || window_left >= 0 || window_right >= 0) {
     auto keep_mask = build_attention_mask(
                          q.size(1),
@@ -162,7 +176,8 @@ std::vector<torch::Tensor> flash_attn_dense_backward(
     int64_t window_right,
     double softcap,
     const c10::optional<torch::Tensor>& learnable_sink_opt,
-    const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
+    const c10::optional<torch::Tensor>& extra_keep_mask_opt,
+    const c10::optional<torch::Tensor>& extra_score_bias_opt) {
   TORCH_CHECK(dout.defined(), "dout must be defined");
   TORCH_CHECK(dout.dim() == 4, "dout must be shaped (batch, seqlen_q, heads, dim_v)");
   TORCH_CHECK(dout.size(0) == q.size(0), "dout batch size must match q");
@@ -192,7 +207,8 @@ std::vector<torch::Tensor> flash_attn_dense_backward(
       window_right,
       softcap,
       learnable_sink_opt,
-      extra_keep_mask_opt);
+      extra_keep_mask_opt,
+      extra_score_bias_opt);
 
   std::vector<torch::Tensor> outputs = {forward_outputs[0]};
   std::vector<torch::Tensor> grad_outputs = {dout};
@@ -227,7 +243,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
          int64_t window_right,
          double softcap,
          const c10::optional<torch::Tensor>& learnable_sink_opt,
-         const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
+         const c10::optional<torch::Tensor>& extra_keep_mask_opt,
+         const c10::optional<torch::Tensor>& extra_score_bias_opt) {
         pybind11::gil_scoped_release no_gil;
         return flash_attn_dense_backward(
             q,
@@ -241,7 +258,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             window_right,
             softcap,
             learnable_sink_opt,
-            extra_keep_mask_opt);
+            extra_keep_mask_opt,
+            extra_score_bias_opt);
       },
       "Compiled dense FA4 backward backend for Windows");
 }

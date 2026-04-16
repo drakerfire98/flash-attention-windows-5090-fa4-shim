@@ -568,6 +568,76 @@ def materialize_dense_keep_mask(
     return keep_mask & mod_mask
 
 
+def _looks_like_additive_score_mod(
+    score_mod: Callable,
+    *,
+    shape: tuple[int, int, int, int],
+    device: torch.device,
+    batch_start_index: int,
+    offset_q: int,
+    offset_k: int,
+    aux_tensors: Optional[list],
+) -> Optional[torch.Tensor]:
+    zero_scores = torch.zeros(shape, device=device, dtype=torch.float32)
+    bias = apply_score_mod(
+        zero_scores,
+        score_mod,
+        batch_start_index=batch_start_index,
+        offset_q=offset_q,
+        offset_k=offset_k,
+        aux_tensors=aux_tensors,
+    )
+    probe_numel = max(shape[0] * shape[1] * shape[2] * shape[3], 1)
+    probe = torch.arange(probe_numel, device=device, dtype=torch.float32).reshape(shape)
+    probe = probe / probe_numel
+    shifted = (probe * -0.75) + 0.125
+    probe_bias = apply_score_mod(
+        probe,
+        score_mod,
+        batch_start_index=batch_start_index,
+        offset_q=offset_q,
+        offset_k=offset_k,
+        aux_tensors=aux_tensors,
+    ) - probe
+    shifted_bias = apply_score_mod(
+        shifted,
+        score_mod,
+        batch_start_index=batch_start_index,
+        offset_q=offset_q,
+        offset_k=offset_k,
+        aux_tensors=aux_tensors,
+    ) - shifted
+    if torch.allclose(probe_bias, bias, atol=1e-6, rtol=0.0) and torch.allclose(
+        shifted_bias, bias, atol=1e-6, rtol=0.0
+    ):
+        return bias.contiguous()
+    return None
+
+
+def materialize_dense_score_bias(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    score_mod: Optional[Callable],
+    aux_tensors: Optional[list],
+    batch_start_index: int,
+    offset_q: int,
+    offset_k: int,
+) -> Optional[torch.Tensor]:
+    if score_mod is None:
+        return None
+    shape = (int(q.shape[0]), int(q.shape[2]), int(q.shape[1]), int(k.shape[1]))
+    return _looks_like_additive_score_mod(
+        score_mod,
+        shape=shape,
+        device=q.device,
+        batch_start_index=batch_start_index,
+        offset_q=offset_q,
+        offset_k=offset_k,
+        aux_tensors=aux_tensors,
+    )
+
+
 def _materialize_paged_kv_cache(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -690,6 +760,63 @@ def materialize_varlen_keep_mask(
             )
         keep_mask[batch_idx, :, :q_len, :k_len] = batch_mask[0]
     return keep_mask
+
+
+def materialize_varlen_score_bias(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    page_table: Optional[torch.Tensor],
+    score_mod: Optional[Callable],
+    aux_tensors: Optional[list],
+) -> Optional[torch.Tensor]:
+    if score_mod is None:
+        return None
+
+    k_input, _, cu_seqlens_k_input, seqused_k_input = prepare_varlen_kv_inputs(
+        k,
+        k,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        page_table=page_table,
+    )
+    q_layout = build_varlen_layout(q, cu_seqlens=cu_seqlens_q, seqused=seqused_q, name="q")
+    k_layout = build_varlen_layout(
+        k_input,
+        cu_seqlens=cu_seqlens_k_input,
+        seqused=seqused_k_input,
+        name="k",
+    )
+    if q_layout.batch != k_layout.batch:
+        raise ValueError("q and kv must describe the same batch size")
+
+    num_heads = int(q.shape[1] if q_layout.packed else q.shape[2])
+    max_q = max(q_layout.used_lengths, default=0)
+    max_k = max(k_layout.used_lengths, default=0)
+    score_bias = torch.zeros((q_layout.batch, num_heads, max_q, max_k), device=q.device, dtype=torch.float32)
+
+    for batch_idx in range(q_layout.batch):
+        q_len = q_layout.used_lengths[batch_idx]
+        k_len = k_layout.used_lengths[batch_idx]
+        if q_len == 0 or k_len == 0:
+            continue
+        batch_bias = _looks_like_additive_score_mod(
+            score_mod,
+            shape=(1, num_heads, q_len, k_len),
+            device=q.device,
+            batch_start_index=batch_idx,
+            offset_q=q_layout.logical_starts[batch_idx],
+            offset_k=k_layout.logical_starts[batch_idx],
+            aux_tensors=aux_tensors,
+        )
+        if batch_bias is None:
+            return None
+        score_bias[batch_idx, :, :q_len, :k_len] = batch_bias[0]
+    return score_bias
 
 
 def attention_forward_dense_local(

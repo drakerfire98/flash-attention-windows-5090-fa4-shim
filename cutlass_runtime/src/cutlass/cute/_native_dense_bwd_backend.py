@@ -161,6 +161,7 @@ def flash_attn_dense_backward_native(
     window_size: tuple[int | None, int | None] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     extra_keep_mask: Optional[torch.Tensor] = None,
+    extra_score_bias: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     verbose_build: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -182,6 +183,9 @@ def flash_attn_dense_backward_native(
     keep_mask_arg: torch.Tensor | None = None
     if extra_keep_mask is not None:
         keep_mask_arg = extra_keep_mask.to(device=q.device, dtype=torch.bool).contiguous()
+    score_bias_arg: torch.Tensor | None = None
+    if extra_score_bias is not None:
+        score_bias_arg = extra_score_bias.to(device=q.device, dtype=torch.float32).contiguous()
     dlse_arg: torch.Tensor | None = None if dlse is None else dlse.contiguous()
 
     dq, dk, dv = backend.flash_attn_dense_backward(
@@ -197,6 +201,7 @@ def flash_attn_dense_backward_native(
         float(softcap),
         sink_arg,
         keep_mask_arg,
+        score_bias_arg,
     )
 
     call_parts: list[str] = []
@@ -208,6 +213,8 @@ def flash_attn_dense_backward_native(
         call_parts.append("window")
     if extra_keep_mask is not None:
         call_parts.append("extra_keep_mask")
+    if extra_score_bias is not None:
+        call_parts.append("extra_score_bias")
     if dlse is not None:
         call_parts.append("lse_grad")
     if not call_parts:

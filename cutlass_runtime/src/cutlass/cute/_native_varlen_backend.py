@@ -262,6 +262,7 @@ def flash_attn_varlen_forward_native(
     window_size: tuple[int | None, int | None] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     extra_keep_mask: Optional[torch.Tensor] = None,
+    extra_score_bias: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     return_lse: bool = False,
     verbose_build: bool = False,
@@ -306,6 +307,9 @@ def flash_attn_varlen_forward_native(
     keep_mask_arg: torch.Tensor | None = None
     if extra_keep_mask is not None:
         keep_mask_arg = extra_keep_mask.to(device=q.device, dtype=torch.bool).contiguous()
+    score_bias_arg: torch.Tensor | None = None
+    if extra_score_bias is not None:
+        score_bias_arg = extra_score_bias.to(device=q.device, dtype=torch.float32).contiguous()
 
     native_out, native_lse = backend.flash_attn_varlen_forward(
         q,
@@ -324,6 +328,7 @@ def flash_attn_varlen_forward_native(
         float(softcap),
         sink_arg,
         keep_mask_arg,
+        score_bias_arg,
     )
 
     call_parts: list[str] = []
@@ -339,6 +344,8 @@ def flash_attn_varlen_forward_native(
         call_parts.append("window")
     if extra_keep_mask is not None:
         call_parts.append("extra_keep_mask")
+    if extra_score_bias is not None:
+        call_parts.append("extra_score_bias")
     _NATIVE_VARLEN_LAST_CALL = "+".join(call_parts)
 
     if out is None:

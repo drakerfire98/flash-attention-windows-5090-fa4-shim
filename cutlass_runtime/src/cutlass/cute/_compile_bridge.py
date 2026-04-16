@@ -29,7 +29,9 @@ from ._runtime_local_core import (
     attention_forward_varlen_local,
     fill_block_sparse_tensors,
     materialize_dense_keep_mask,
+    materialize_dense_score_bias,
     materialize_varlen_keep_mask,
+    materialize_varlen_score_bias,
 )
 
 
@@ -800,7 +802,31 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     "Block-sparse native probe backward bridge is missing the original block size metadata"
                 )
             is_varlen = any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table))
-            if not is_varlen and score_mod is None:
+            structured_score_bias = None
+            if score_mod is not None and mask_mod is None and block_sparse_tensors is None and softcap_value == 0.0:
+                if is_varlen:
+                    structured_score_bias = materialize_varlen_score_bias(
+                        q_req,
+                        k_req,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        seqused_q=seqused_q,
+                        seqused_k=seqused_k,
+                        page_table=page_table,
+                        score_mod=score_mod,
+                        aux_tensors=aux_tensors,
+                    )
+                else:
+                    structured_score_bias = materialize_dense_score_bias(
+                        q_req,
+                        k_req,
+                        score_mod=score_mod,
+                        aux_tensors=aux_tensors,
+                        batch_start_index=0,
+                        offset_q=0,
+                        offset_k=0,
+                    )
+            if not is_varlen and score_mod is None and softcap_value == 0.0:
                 extra_keep_mask = None
                 if mask_mod is not None or block_sparse_tensors is not None:
                     extra_keep_mask = materialize_dense_keep_mask(
@@ -847,7 +873,41 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                     return
                 except Exception:
                     pass
-            if is_varlen and score_mod is None:
+            if not is_varlen and structured_score_bias is not None:
+                dlse_native = None
+                if dlse is not None:
+                    expected_lse = torch.empty(
+                        (q.shape[0], q.shape[1], q.shape[2]),
+                        device=dlse.device,
+                        dtype=dlse.dtype,
+                    )
+                    dlse_native = _convert_tensor_like(dlse, expected_lse)
+                try:
+                    dq_grad, dk_grad, dv_grad = flash_attn_dense_backward_native(
+                        q_req,
+                        k_req,
+                        v_req,
+                        dout,
+                        dlse=dlse_native,
+                        softmax_scale=softmax_scale,
+                        causal=bool(getattr(self.kernel, "is_causal", False)),
+                        window_size=window_size,
+                        learnable_sink=learnable_sink,
+                        extra_score_bias=structured_score_bias,
+                        softcap=softcap_value,
+                    )
+                    _POSTPROCESS_RESULTS[dq_accum.data_ptr()] = dq_grad.detach()
+                    qhead_per_kvhead = int(getattr(self.kernel, "qhead_per_kvhead", 1))
+                    if qhead_per_kvhead > 1:
+                        _POSTPROCESS_RESULTS[dk_or_accum.data_ptr()] = dk_grad.detach()
+                        _POSTPROCESS_RESULTS[dv_or_accum.data_ptr()] = dv_grad.detach()
+                    else:
+                        _copy_tensor_like(dk_or_accum, dk_grad.detach())
+                        _copy_tensor_like(dv_or_accum, dv_grad.detach())
+                    return
+                except Exception:
+                    pass
+            if is_varlen and score_mod is None and softcap_value == 0.0:
                 extra_keep_mask = None
                 if mask_mod is not None or block_sparse_tensors is not None:
                     extra_keep_mask = materialize_varlen_keep_mask(
@@ -895,6 +955,52 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
                         window_size=window_size,
                         learnable_sink=learnable_sink,
                         extra_keep_mask=extra_keep_mask,
+                        softcap=softcap_value,
+                    )
+                    _POSTPROCESS_RESULTS[dq_accum.data_ptr()] = dq_grad.detach()
+                    qhead_per_kvhead = int(getattr(self.kernel, "qhead_per_kvhead", 1))
+                    if qhead_per_kvhead > 1:
+                        _POSTPROCESS_RESULTS[dk_or_accum.data_ptr()] = dk_grad.detach()
+                        _POSTPROCESS_RESULTS[dv_or_accum.data_ptr()] = dv_grad.detach()
+                    else:
+                        _copy_tensor_like(dk_or_accum, dk_grad.detach())
+                        _copy_tensor_like(dv_or_accum, dv_grad.detach())
+                    return
+                except Exception:
+                    pass
+            if is_varlen and structured_score_bias is not None:
+                dlse_native = None
+                if dlse is not None:
+                    if cu_seqlens_q is not None:
+                        expected_lse = torch.empty(
+                            (q.shape[0], q.shape[1]),
+                            device=dlse.device,
+                            dtype=dlse.dtype,
+                        )
+                    else:
+                        expected_lse = torch.empty(
+                            (q.shape[0], q.shape[1], q.shape[2]),
+                            device=dlse.device,
+                            dtype=dlse.dtype,
+                        )
+                    dlse_native = _convert_tensor_like(dlse, expected_lse)
+                try:
+                    dq_grad, dk_grad, dv_grad = flash_attn_varlen_backward_native(
+                        q_req,
+                        k_req,
+                        v_req,
+                        dout,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        seqused_q=seqused_q,
+                        seqused_k=seqused_k,
+                        page_table=page_table,
+                        dlse=dlse_native,
+                        softmax_scale=softmax_scale,
+                        causal=bool(getattr(self.kernel, "is_causal", False)),
+                        window_size=window_size,
+                        learnable_sink=learnable_sink,
+                        extra_score_bias=structured_score_bias,
                         softcap=softcap_value,
                     )
                     _POSTPROCESS_RESULTS[dq_accum.data_ptr()] = dq_grad.detach()

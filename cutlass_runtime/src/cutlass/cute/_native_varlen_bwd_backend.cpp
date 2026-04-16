@@ -41,7 +41,8 @@ std::vector<torch::Tensor> dense_forward_chunk(
     int64_t window_right,
     double softcap,
     const c10::optional<torch::Tensor>& learnable_sink_opt,
-    const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
+    const c10::optional<torch::Tensor>& extra_keep_mask_opt,
+    const c10::optional<torch::Tensor>& extra_score_bias_opt) {
   TORCH_CHECK(q.dim() == 4, "q chunk must be shaped (batch, seqlen_q, heads, dim)");
   TORCH_CHECK(k.dim() == 4, "k chunk must be shaped (batch, seqlen_k, heads, dim)");
   TORCH_CHECK(v.dim() == 4, "v chunk must be shaped (batch, seqlen_k, heads, dim_v)");
@@ -66,6 +67,19 @@ std::vector<torch::Tensor> dense_forward_chunk(
   }
 
   auto scores = torch::matmul(q_t, k_t.transpose(-1, -2)) * softmax_scale;
+  if (extra_score_bias_opt.has_value() && extra_score_bias_opt.value().defined()) {
+    auto extra_score_bias = extra_score_bias_opt.value().to(scores.device(), torch::kFloat);
+    TORCH_CHECK(
+        extra_score_bias.dim() == 4,
+        "extra_score_bias chunk must be shaped (batch, heads, seqlen_q, seqlen_k)");
+    TORCH_CHECK(
+        extra_score_bias.size(0) == scores.size(0) &&
+            extra_score_bias.size(1) == scores.size(1) &&
+            extra_score_bias.size(2) == scores.size(2) &&
+            extra_score_bias.size(3) == scores.size(3),
+        "extra_score_bias chunk shape must match the expanded attention score shape");
+    scores = scores + extra_score_bias;
+  }
   if (causal || window_left >= 0 || window_right >= 0) {
     auto keep_mask = build_attention_mask(
                          q.size(1),
@@ -192,7 +206,8 @@ std::vector<torch::Tensor> flash_attn_varlen_forward_internal(
     int64_t window_right,
     double softcap,
     const c10::optional<torch::Tensor>& learnable_sink_opt,
-    const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
+    const c10::optional<torch::Tensor>& extra_keep_mask_opt,
+    const c10::optional<torch::Tensor>& extra_score_bias_opt) {
   TORCH_CHECK(q.device() == k.device(), "q and k must be on the same device");
   TORCH_CHECK(q.device() == v.device(), "q and v must be on the same device");
   TORCH_CHECK(
@@ -229,6 +244,15 @@ std::vector<torch::Tensor> flash_attn_varlen_forward_internal(
     TORCH_CHECK(
         extra_keep_mask.size(0) == batch && extra_keep_mask.size(1) == q_heads,
         "extra_keep_mask batch/head dims must match the q layout");
+  }
+  if (extra_score_bias_opt.has_value() && extra_score_bias_opt.value().defined()) {
+    auto extra_score_bias = extra_score_bias_opt.value();
+    TORCH_CHECK(
+        extra_score_bias.dim() == 4,
+        "extra_score_bias must be shaped (batch, heads, max_q, max_k)");
+    TORCH_CHECK(
+        extra_score_bias.size(0) == batch && extra_score_bias.size(1) == q_heads,
+        "extra_score_bias batch/head dims must match the q layout");
   }
 
   if (q_packed) {
@@ -304,6 +328,13 @@ std::vector<torch::Tensor> flash_attn_varlen_forward_internal(
                                   .narrow(2, 0, q_len)
                                   .narrow(3, 0, k_len);
     }
+    c10::optional<torch::Tensor> extra_score_bias_chunk = c10::nullopt;
+    if (extra_score_bias_opt.has_value() && extra_score_bias_opt.value().defined()) {
+      extra_score_bias_chunk = extra_score_bias_opt.value()
+                                   .narrow(0, batch_idx, 1)
+                                   .narrow(2, 0, q_len)
+                                   .narrow(3, 0, k_len);
+    }
     if (q_len == 0 || k_len == 0) {
       out_chunk = torch::zeros({1, q_len, q_heads, v_dim}, q.options());
       lse_chunk = torch::full(
@@ -321,7 +352,8 @@ std::vector<torch::Tensor> flash_attn_varlen_forward_internal(
           window_right,
           softcap,
           learnable_sink_opt,
-          extra_keep_mask_chunk);
+          extra_keep_mask_chunk,
+          extra_score_bias_chunk);
       out_chunk = chunk_result[0];
       lse_chunk = chunk_result[1];
     }
@@ -367,7 +399,8 @@ std::vector<torch::Tensor> flash_attn_varlen_backward(
     int64_t window_right,
     double softcap,
     const c10::optional<torch::Tensor>& learnable_sink_opt,
-    const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
+    const c10::optional<torch::Tensor>& extra_keep_mask_opt,
+    const c10::optional<torch::Tensor>& extra_score_bias_opt) {
   TORCH_CHECK(dout.defined(), "dout must be defined");
 
   torch::autograd::AutoGradMode enable_grad(true);
@@ -401,7 +434,8 @@ std::vector<torch::Tensor> flash_attn_varlen_backward(
       window_right,
       softcap,
       learnable_sink_opt,
-      extra_keep_mask_opt);
+      extra_keep_mask_opt,
+      extra_score_bias_opt);
 
   std::vector<torch::Tensor> outputs = {forward_outputs[0]};
   std::vector<torch::Tensor> grad_outputs = {dout};
@@ -443,7 +477,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
          int64_t window_right,
          double softcap,
          const c10::optional<torch::Tensor>& learnable_sink_opt,
-         const c10::optional<torch::Tensor>& extra_keep_mask_opt) {
+         const c10::optional<torch::Tensor>& extra_keep_mask_opt,
+         const c10::optional<torch::Tensor>& extra_score_bias_opt) {
         pybind11::gil_scoped_release no_gil;
         return flash_attn_varlen_backward(
             q,
@@ -464,7 +499,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             window_right,
             softcap,
             learnable_sink_opt,
-            extra_keep_mask_opt);
+            extra_keep_mask_opt,
+            extra_score_bias_opt);
       },
       "Compiled varlen FA4 backward backend for Windows");
 }

@@ -6,7 +6,7 @@
 
 - Replaced `cutlass_runtime/src/cutlass/__init__.py` with a repo-local root implementation:
   - `cutlass.__file__` now resolves to the local runtime package instead of the legacy editable CUTLASS root
-  - the package now reports `NATIVE_PROBE_MODE=runtime-local-core`
+  - the package now reports `NATIVE_PROBE_MODE=runtime-local-owned`
   - it eagerly exposes local / repo-local `base_dsl`, `pipeline`, `utils`, `cutlass_dsl`, and `_mlir`
 - Added a repo-local `cutlass.cute` package under `cutlass_runtime/src/cutlass/cute/`:
   - `cutlass.cute.__file__` now resolves to the local runtime package instead of `native_probe_shims/`
@@ -103,7 +103,7 @@
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_cutlass_runtime.py`
   - `raw_cutlass_spec` now resolves to `cutlass_runtime/src/cutlass/__init__.py`
   - `raw_cuda_spec` now resolves to `runtime_compat/src/cuda/__init__.py`
-  - `cutlass_probe_mode=runtime-local-core`
+  - `cutlass_probe_mode=runtime-local-owned`
   - `cute_file` now resolves to `cutlass_runtime/src/cutlass/cute/__init__.py`
   - `cute_compile_bridge_file` now resolves to `cutlass_runtime/src/cutlass/cute/_compile_bridge.py`
   - `runtime_cuda_file` now resolves to `cutlass_runtime/src/cutlass/base_dsl/runtime/cuda.py`
@@ -135,9 +135,9 @@
   - `native_dense_backend_post["loaded"] = True`
   - `native_varlen_backend_post["loaded"] = True`
   - `native_varlen_backend_post["last_call"] = "padded_q+padded_k+page_table"`
-  - plain varlen `softcap` is now near-exact on the compiled slice:
-    - `varlen_softcap_out_max_diff=3.814697265625e-06`
-    - `varlen_softcap_lse_max_diff=1.8894672393798828e-05`
+  - plain varlen `softcap` now routes through the exact runtime-owned path:
+    - `varlen_softcap_out_max_diff=0.0`
+    - `varlen_softcap_lse_max_diff=0.0`
 - `.\.venv_fa4\Scripts\python.exe scripts\probe_native_fa4_backward.py`
   - `varlen_paged_kv_grad_max_diff=0.0`
   - `varlen_softcap_score_mod_grad_max_diff=0.0`
@@ -176,12 +176,13 @@
 - The environment is still not a true Windows-native CuTe/CUTLASS DSL runtime.
 - The root package, the top-level `cutlass.cute` package, the heavy compile bridge, the `base_dsl.runtime.cuda` loader path, and the currently imported `cutlass_dsl` / `pipeline` / `utils` / `_mlir` surfaces are now local.
 - The remaining blocker is no longer active `cutlass.*` leakage from `native_probe_shims` or a direct runtime dependency on `shims/flash_attn/cute`; the forward-combine family, the broader plain dense forward family, the broader plain varlen forward family, and the backward helper family now build through real compiled Windows extensions, and the modifier families now route through repo-owned local runtime code, but the rest of `cutlass.cute.compile` still resolves recognized kernels to repo-local bridge objects instead of a true compiled Windows CuTe/CUTLASS DSL backend.
-- The current probe mode is now `runtime-local-core`, which is better than `runtime-wrapper+legacy-core` but still not a true native compiler/runtime.
+- The current probe mode is now `runtime-local-owned`, which is better than `runtime-wrapper+legacy-core` but still not a true native compiler/runtime.
 - The active `flash_attn.cute.interface` surface is now repo-local under `flash_attn_runtime/src/flash_attn/cute/interface.py`; the upstream clone is now a refresh source, not a live runtime dependency.
 - `scripts/patch_flash_attn_sm120_backward.py` now defaults to that repo-local overlay target instead of the upstream clone path.
 - The public backward path now accepts dense `deterministic=True`, plain varlen `score_mod`, varlen `seqused + score_mod`, and varlen `softcap + score_mod` through the replay bridge, and the native backward probe reports exact parity for those cases.
 - The dense backward bridge now also has a compiled Windows slice for the tested dense plain, local-window, `learnable_sink`, and keep-mask cases.
-- Dense `softcap` now routes through the exact repo-local runtime path, so the seeded forward and backward probes are exact again against the stable Windows shim.
+- Dense and varlen plain `softcap` backward now route through the exact repo-local runtime replay path, so the seeded backward probes report `dense_softcap_grad_max_diff=0.0` and `varlen_softcap_grad_max_diff=0.0` again against the stable Windows shim.
+- The structured additive-bias varlen `score_mod` backward family now has a native-backed slice through the `extra_score_bias` path in `fa4_win_vbwd_ext`, while arbitrary richer `score_mod` families still fall back to the repo-owned bridge/runtime path.
 - The forward-combine probe now reports `NativeCompiledForwardCombineBridge` with `backend=compiled`, backed by `fa4_windows_native_combine_ext.cp313-win_amd64.pyd`, and all tested batched/varlen/dynamic combine cases remain exact.
 - The forward probe now reports `NativeProbeForwardBridge ... dense_backend=compiled varlen_backend=compiled`, backed by `fa4_windows_native_dense_ext.cp313-win_amd64.pyd` and `fa4_win_varlen_ext.cp313-win_amd64.pyd`, and the backward replay probe reuses those same compiled slices without regressing the seeded parity checks.
 
@@ -190,5 +191,5 @@
 - Keep `scripts/sync_flash_attn_runtime_overlay.py` and `scripts/patch_flash_attn_sm120_backward.py` as the single source of truth for overlay refreshes after each upstream sync.
 - Extend validator/probe coverage only when new FA4 surface area is actually added.
 - Keep pushing the real blocker:
-  - replacing more of `runtime-local-core` with genuine compiled Windows backend slices instead of repo-local bridge objects.
+  - replacing more of `runtime-local-owned` with genuine compiled Windows backend slices instead of repo-local bridge objects.
   - the next high-value targets are a broader native backward family beyond replay-on-shim for modifier paths, and eventually a true end-to-end Windows CuTe/CUTLASS DSL runtime behind `cutlass.cute.compile`.
