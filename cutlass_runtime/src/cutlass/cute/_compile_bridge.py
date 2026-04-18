@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import importlib
+import builtins
+import marshal
 import json
+from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+import types
 from typing import Any, Callable
 
 import torch
@@ -127,28 +131,85 @@ def _dynamic_kernel_type(name: str):
     return type(name, (), {})
 
 
+def _serialize_simple_value(value: Any) -> dict[str, Any]:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return {"kind": "literal", "value": value}
+    if isinstance(value, tuple):
+        return {"kind": "tuple", "items": [_serialize_simple_value(item) for item in value]}
+    raise NotImplementedError(f"Unsupported closure/default value for persistent export: {value!r}")
+
+
+def _deserialize_simple_value(payload: dict[str, Any]) -> Any:
+    kind = payload["kind"]
+    if kind == "literal":
+        return payload["value"]
+    if kind == "tuple":
+        return tuple(_deserialize_simple_value(item) for item in payload["items"])
+    raise ValueError(f"Unsupported serialized simple value kind: {kind!r}")
+
+
+def _make_cell(value: Any):
+    return (lambda x: lambda: x)(value).__closure__[0]
+
+
 def _serialize_python_callable(fn: Any) -> dict[str, str] | None:
     if fn is None:
         return None
     module_name = getattr(fn, "__module__", None)
     qualname = getattr(fn, "__qualname__", None)
     if not module_name or not qualname or "<locals>" in qualname:
-        raise NotImplementedError(
-            f"Persistent export only supports importable top-level callables, got {fn!r}"
-        )
+        if isinstance(fn, types.FunctionType):
+            closure = tuple(cell.cell_contents for cell in (fn.__closure__ or ()))
+            return {
+                "kind": "function_blob",
+                "module": str(module_name or "__main__"),
+                "name": str(getattr(fn, "__name__", "anonymous_fn")),
+                "qualname": str(qualname or getattr(fn, "__name__", "anonymous_fn")),
+                "code_b64": b64encode(marshal.dumps(fn.__code__)).decode("ascii"),
+                "defaults": [_serialize_simple_value(value) for value in (fn.__defaults__ or ())],
+                "kwdefaults": {
+                    key: _serialize_simple_value(value)
+                    for key, value in (fn.__kwdefaults__ or {}).items()
+                },
+                "closure": [_serialize_simple_value(value) for value in closure],
+            }
+        raise NotImplementedError(f"Persistent export only supports serializable callables, got {fn!r}")
     return {
+        "kind": "import_ref",
         "module": str(module_name),
         "qualname": str(qualname),
     }
 
 
-def _load_python_callable(payload: dict[str, str] | None) -> Any:
+def _load_python_callable(payload: dict[str, Any] | None) -> Any:
     if payload is None:
         return None
-    obj: Any = importlib.import_module(payload["module"])
-    for part in str(payload["qualname"]).split("."):
-        obj = getattr(obj, part)
-    return obj
+    kind = payload.get("kind", "import_ref")
+    if kind == "import_ref":
+        obj: Any = importlib.import_module(payload["module"])
+        for part in str(payload["qualname"]).split("."):
+            obj = getattr(obj, part)
+        return obj
+    if kind == "function_blob":
+        module_name = str(payload["module"])
+        module = importlib.import_module(module_name) if module_name not in {"", "__main__"} else None
+        globals_dict: dict[str, Any] = {"__builtins__": builtins.__dict__}
+        if module is not None:
+            globals_dict.update(module.__dict__)
+        code = marshal.loads(b64decode(payload["code_b64"]))
+        defaults = tuple(_deserialize_simple_value(value) for value in payload.get("defaults", [])) or None
+        kwdefaults = {
+            key: _deserialize_simple_value(value)
+            for key, value in payload.get("kwdefaults", {}).items()
+        } or None
+        closure_values = [_deserialize_simple_value(value) for value in payload.get("closure", [])]
+        closure = tuple(_make_cell(value) for value in closure_values) or None
+        fn = types.FunctionType(code, globals_dict, str(payload.get("name", code.co_name)), defaults, closure)
+        fn.__kwdefaults__ = kwdefaults
+        fn.__module__ = module_name
+        fn.__qualname__ = str(payload.get("qualname", payload.get("name", code.co_name)))
+        return fn
+    raise ValueError(f"Unsupported callable payload kind: {kind!r}")
 
 
 def _serialize_executor(executor: Callable[..., Any], spec: NativePlanSpec) -> dict[str, Any]:
