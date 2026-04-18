@@ -77,6 +77,7 @@ NATIVE_PROBE_DIST_VERSIONS = {
     "cutlass": try_dist_version("cutlass"),
     "nvidia-cutlass-dsl": try_dist_version("nvidia-cutlass-dsl"),
 }
+__version__ = NATIVE_PROBE_DIST_VERSIONS["cutlass"] or "0.0.0"
 NATIVE_PROBE_REASON = (
     "Using the repo-local cutlass_runtime root package and runtime-owned "
     "CUTLASS compatibility subpackages instead of the legacy editable "
@@ -224,4 +225,5 @@ __all__ = [
     "NATIVE_PROBE_FALLBACK_ROOTS",
     "NATIVE_PROBE_DIST_VERSIONS",
     "NATIVE_PROBE_REASON",
+    "__version__",
 ]
