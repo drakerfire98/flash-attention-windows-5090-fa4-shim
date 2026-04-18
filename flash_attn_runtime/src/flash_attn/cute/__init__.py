@@ -9,7 +9,7 @@ import cutlass.cute as cute
 from cutlass.cute._compile_bridge import NativePatchedRuntimeCompiler
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _PACKAGE_DIR.parents[4]
+_REPO_ROOT = _PACKAGE_DIR.parents[3]
 _UPSTREAM_CUTE_DIR = _REPO_ROOT / "third_party" / "flash-attention-for-windows" / "flash_attn" / "cute"
 
 __path__ = [str(_PACKAGE_DIR), str(_UPSTREAM_CUTE_DIR)]  # type: ignore[assignment]
