@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import torch
@@ -80,8 +83,18 @@ class NativeCompiledPlan(JitCompiledFunction):
         )
 
     def export_to_c(self, *args, **kwargs):
-        del args, kwargs
-        return self.spec.as_dict()
+        object_file_path = kwargs.get("object_file_path")
+        function_name = kwargs.get("function_name", "func")
+        if object_file_path is None:
+            raise ValueError("NativeCompiledPlan.export_to_c requires object_file_path=...")
+        manifest = {
+            "format": "native-compiled-plan-v1",
+            "function_name": str(function_name),
+            "spec": self.spec.as_dict(),
+            "executor": _serialize_executor(self._executor, self.spec),
+        }
+        Path(object_file_path).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return manifest
 
 
 class NativeRuntimeCompiler:
@@ -107,6 +120,93 @@ class NativePatchedRuntimeCompiler(NativeRuntimeCompiler):
             "<NativePatchedRuntimeCompiler runtime=runtime-local-owned "
             "surface=plan-backed cubin-dump-patch=enabled>"
         )
+
+
+def _dynamic_kernel_type(name: str):
+    return type(name, (), {})
+
+
+def _serialize_executor(executor: Callable[..., Any], spec: NativePlanSpec) -> dict[str, Any]:
+    if isinstance(executor, NativeProbeForwardBridge):
+        return {
+            "kind": "forward_bridge",
+            "kernel": _serialize_kernel_payload(executor.kernel, spec),
+        }
+    if isinstance(executor, NativeProbeBackwardBridge):
+        return {
+            "kind": "backward_bridge",
+            "kernel": _serialize_kernel_payload(executor.kernel, spec),
+        }
+    if isinstance(executor, NativeProbeBackwardPreprocessBridge):
+        return {"kind": "backward_preprocess"}
+    if isinstance(executor, NativeProbeBackwardPostprocessBridge):
+        return {"kind": "backward_postprocess"}
+    if isinstance(executor, NativeCompiledForwardCombineBridge):
+        return {"kind": "forward_combine"}
+    if isinstance(executor, NativeProbeUnsupportedBridge):
+        return {"kind": "unsupported", "op_name": executor.op_name}
+    raise NotImplementedError(f"Native plan export does not support executor type {type(executor).__name__}")
+
+
+def _serialize_kernel_payload(kernel: Any, spec: NativePlanSpec) -> dict[str, Any]:
+    modifier_family = spec.modifier_family
+    score_mod = getattr(kernel, "score_mod", None)
+    softcap, nested_score_mod = _extract_softcap_score_mod_components(score_mod)
+    if modifier_family in {"keep-mask", "score-bias", "softcap+score-bias", "score-mod-bwd"}:
+        raise NotImplementedError(
+            f"Persistent export is not yet supported for modifier family {modifier_family!r}"
+        )
+    if getattr(kernel, "mask_mod", None) is not None:
+        raise NotImplementedError("Persistent export does not support callable mask_mod kernels yet")
+    if nested_score_mod is not None:
+        raise NotImplementedError("Persistent export does not support nested score_mod kernels yet")
+    attrs = {
+        "is_causal": bool(getattr(kernel, "is_causal", False)),
+        "is_local": bool(getattr(kernel, "is_local", False)),
+        "qhead_per_kvhead": int(getattr(kernel, "qhead_per_kvhead", 1) or 1),
+    }
+    for name in ("tile_m", "tile_n", "q_subtile_factor"):
+        value = getattr(kernel, name, None)
+        if value is not None:
+            attrs[name] = int(value)
+    if softcap is not None:
+        attrs["_native_export_softcap"] = float(softcap)
+    return {
+        "op_name": type(kernel).__name__,
+        "attrs": attrs,
+    }
+
+
+def _hydrate_kernel_payload(payload: dict[str, Any]) -> Any:
+    kernel_type = _dynamic_kernel_type(str(payload["op_name"]))
+    kernel = kernel_type()
+    for name, value in dict(payload.get("attrs", {})).items():
+        setattr(kernel, name, value)
+    return kernel
+
+
+def load_exported_native_plan(manifest: dict[str, Any]) -> tuple[str, NativeCompiledPlan]:
+    if manifest.get("format") != "native-compiled-plan-v1":
+        raise ValueError(f"Unsupported native plan manifest format: {manifest.get('format')!r}")
+    spec = NativePlanSpec(**dict(manifest["spec"]))
+    executor_manifest = dict(manifest["executor"])
+    kind = executor_manifest["kind"]
+    if kind == "forward_bridge":
+        executor: Callable[..., Any] = NativeProbeForwardBridge(_hydrate_kernel_payload(executor_manifest["kernel"]))
+    elif kind == "backward_bridge":
+        executor = NativeProbeBackwardBridge(_hydrate_kernel_payload(executor_manifest["kernel"]))
+    elif kind == "backward_preprocess":
+        executor = NativeProbeBackwardPreprocessBridge()
+    elif kind == "backward_postprocess":
+        executor = NativeProbeBackwardPostprocessBridge()
+    elif kind == "forward_combine":
+        executor = NativeCompiledForwardCombineBridge()
+    elif kind == "unsupported":
+        op_name = str(executor_manifest.get("op_name", spec.op_name))
+        executor = NativeProbeUnsupportedBridge(SimpleNamespace(__class__=_dynamic_kernel_type(op_name)))
+    else:
+        raise ValueError(f"Unsupported native plan executor kind: {kind!r}")
+    return str(manifest.get("function_name", "func")), NativeCompiledPlan(spec, executor)
 def _copy_tensor_like(dst: torch.Tensor | None, src: torch.Tensor | None) -> None:
     if dst is None or src is None:
         return
@@ -761,7 +861,10 @@ class NativeProbeForwardBridge(JitCompiledFunction):
         window_size = _window_tuple(window_size_left, window_size_right)
         score_mod = getattr(self.kernel, "score_mod", None)
         mask_mod = getattr(self.kernel, "mask_mod", None)
+        explicit_softcap = getattr(self.kernel, "_native_export_softcap", None)
         softcap, score_mod = _extract_softcap_score_mod_components(score_mod)
+        if explicit_softcap is not None and softcap is None:
+            softcap = float(explicit_softcap)
         shim_out, shim_lse, block_size = _run_forward_with_bridge_runtime(
             kernel=self.kernel,
             q=q,
@@ -908,12 +1011,15 @@ class NativeProbeBackwardBridge(JitCompiledFunction):
         dlse = _DLSE_BY_DQACCUM.pop(dq_accum.data_ptr(), None)
         compat_metadata = _BWD_METADATA_BY_DQACCUM.pop(dq_accum.data_ptr(), {})
         kernel_score_mod = getattr(self.kernel, "score_mod", None)
+        explicit_softcap = getattr(self.kernel, "_native_export_softcap", None)
         composed_softcap, _ = _extract_softcap_score_mod_components(kernel_score_mod)
         softcap_value = 0.0 if softcap is None else float(softcap)
         if composed_softcap is not None:
             # The backward kernel already carries a score_mod wrapper that folds
             # softcap into the score transform, so replay should not re-apply it.
             softcap_value = 0.0
+        elif explicit_softcap is not None:
+            softcap_value = float(explicit_softcap)
         elif softcap_value == 0.0:
             softcap_value = float(compat_metadata.get("softcap", 0.0) or 0.0)
         with torch.enable_grad():

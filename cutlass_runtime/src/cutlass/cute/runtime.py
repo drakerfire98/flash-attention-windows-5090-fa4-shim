@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from itertools import count
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -119,6 +122,15 @@ def from_dlpack(value, *args, **kwargs):
 
 def make_fake_stream(*, use_tvm_ffi_env_stream: bool = False):
     return FakeStream(use_tvm_ffi_env_stream=use_tvm_ffi_env_stream)
+
+
+def load_module(path: str, *, enable_tvm_ffi: bool = False):
+    del enable_tvm_ffi
+    manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    from cutlass.cute._compile_bridge import load_exported_native_plan
+
+    function_name, compiled_plan = load_exported_native_plan(manifest)
+    return SimpleNamespace(**{function_name: compiled_plan})
 
 
 __getattr__ = module_getattr("cutlass.cute.runtime")
