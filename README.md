@@ -19,6 +19,8 @@ This repo preserves the exact working path that compiled and ran a CUDA smoke te
 The best current native-attempt FA4 work is published on:
 
 - `experimental-native-fa4-current-best-31`
+- branch URL: `https://github.com/drakerfire98/flash-attention-windows-5090-fa4-shim/tree/experimental-native-fa4-current-best-31`
+- compare vs `main`: `https://github.com/drakerfire98/flash-attention-windows-5090-fa4-shim/compare/main...experimental-native-fa4-current-best-31`
 
 That branch is the clearest public place to look if you want to help push the Windows native path farther. It contains the strongest current native-attempt state, while `main` remains the stable shim-first branch.
 
