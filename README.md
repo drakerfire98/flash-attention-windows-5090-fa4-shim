@@ -14,6 +14,19 @@ Working Windows build notes, patches, and smoke tests for building FlashAttentio
 
 This repo preserves the exact working path that compiled and ran a CUDA smoke test on the target machine. The main blocker we had to fix was PyTorch's Windows ninja generation quoting `nvcc` with POSIX-style single quotes, which breaks `CreateProcess` on Windows.
 
+## Experimental Native Branch
+
+The best current native-attempt FA4 work is published on:
+
+- `experimental-native-fa4-current-best-31`
+
+That branch is the clearest public place to look if you want to help push the Windows native path farther. It contains the strongest current native-attempt state, while `main` remains the stable shim-first branch.
+
+If you want the exact matching historical branch names for that state, see:
+
+- `native-fa4-attempt-01`
+- `current-best-31`
+
 ## What Is Here
 
 - `docs/KNOWN_GOOD_ENV.md`: exact versions that worked
