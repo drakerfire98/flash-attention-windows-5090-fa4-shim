@@ -83,7 +83,11 @@ def load_native_varlen_backend(*, verbose: bool = False, force_rebuild: bool = F
             )
             needs_rebuild = newest_module is None or newest_module.stat().st_mtime < source_mtime
             if needs_rebuild:
-                build_temp_dir = build_dir / "temp"
+                short_tmp = os.environ.get("FA4_WINDOWS_SHORT_BUILD_TMP", "").strip()
+                if short_tmp:
+                    build_temp_dir = Path(short_tmp) / native_varlen_extension_name()
+                else:
+                    build_temp_dir = build_dir / "temp"
                 build_temp_dir.mkdir(parents=True, exist_ok=True)
                 cmd = [
                     sys.executable,

@@ -83,7 +83,11 @@ def load_native_dense_bwd_backend(*, verbose: bool = False, force_rebuild: bool 
             )
             needs_rebuild = newest_module is None or newest_module.stat().st_mtime < source_mtime
             if needs_rebuild:
-                build_temp_dir = build_dir / "t"
+                short_tmp = os.environ.get("FA4_WINDOWS_SHORT_BUILD_TMP", "").strip()
+                if short_tmp:
+                    build_temp_dir = Path(short_tmp) / native_dense_bwd_extension_name()
+                else:
+                    build_temp_dir = build_dir / "t"
                 build_temp_dir.mkdir(parents=True, exist_ok=True)
                 cmd = [
                     sys.executable,
