@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,6 +127,30 @@ def _dynamic_kernel_type(name: str):
     return type(name, (), {})
 
 
+def _serialize_python_callable(fn: Any) -> dict[str, str] | None:
+    if fn is None:
+        return None
+    module_name = getattr(fn, "__module__", None)
+    qualname = getattr(fn, "__qualname__", None)
+    if not module_name or not qualname or "<locals>" in qualname:
+        raise NotImplementedError(
+            f"Persistent export only supports importable top-level callables, got {fn!r}"
+        )
+    return {
+        "module": str(module_name),
+        "qualname": str(qualname),
+    }
+
+
+def _load_python_callable(payload: dict[str, str] | None) -> Any:
+    if payload is None:
+        return None
+    obj: Any = importlib.import_module(payload["module"])
+    for part in str(payload["qualname"]).split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
 def _serialize_executor(executor: Callable[..., Any], spec: NativePlanSpec) -> dict[str, Any]:
     if isinstance(executor, NativeProbeForwardBridge):
         return {
@@ -152,14 +177,7 @@ def _serialize_kernel_payload(kernel: Any, spec: NativePlanSpec) -> dict[str, An
     modifier_family = spec.modifier_family
     score_mod = getattr(kernel, "score_mod", None)
     softcap, nested_score_mod = _extract_softcap_score_mod_components(score_mod)
-    if modifier_family in {"keep-mask", "score-bias", "softcap+score-bias", "score-mod-bwd"}:
-        raise NotImplementedError(
-            f"Persistent export is not yet supported for modifier family {modifier_family!r}"
-        )
-    if getattr(kernel, "mask_mod", None) is not None:
-        raise NotImplementedError("Persistent export does not support callable mask_mod kernels yet")
-    if nested_score_mod is not None:
-        raise NotImplementedError("Persistent export does not support nested score_mod kernels yet")
+    mask_mod = getattr(kernel, "mask_mod", None)
     attrs = {
         "is_causal": bool(getattr(kernel, "is_causal", False)),
         "is_local": bool(getattr(kernel, "is_local", False)),
@@ -171,10 +189,22 @@ def _serialize_kernel_payload(kernel: Any, spec: NativePlanSpec) -> dict[str, An
             attrs[name] = int(value)
     if softcap is not None:
         attrs["_native_export_softcap"] = float(softcap)
-    return {
+    payload = {
         "op_name": type(kernel).__name__,
         "attrs": attrs,
+        "score_mod_ref": None,
+        "mask_mod_ref": None,
     }
+    if nested_score_mod is not None:
+        payload["score_mod_ref"] = _serialize_python_callable(nested_score_mod)
+    elif score_mod is not None:
+        payload["score_mod_ref"] = _serialize_python_callable(score_mod)
+    if mask_mod is not None:
+        payload["mask_mod_ref"] = _serialize_python_callable(mask_mod)
+    score_mod_bwd = getattr(kernel, "score_mod_bwd", None)
+    if score_mod_bwd is not None:
+        payload["score_mod_bwd_ref"] = _serialize_python_callable(score_mod_bwd)
+    return payload
 
 
 def _hydrate_kernel_payload(payload: dict[str, Any]) -> Any:
@@ -182,6 +212,12 @@ def _hydrate_kernel_payload(payload: dict[str, Any]) -> Any:
     kernel = kernel_type()
     for name, value in dict(payload.get("attrs", {})).items():
         setattr(kernel, name, value)
+    if "score_mod_ref" in payload:
+        setattr(kernel, "score_mod", _load_python_callable(payload.get("score_mod_ref")))
+    if "mask_mod_ref" in payload:
+        setattr(kernel, "mask_mod", _load_python_callable(payload.get("mask_mod_ref")))
+    if "score_mod_bwd_ref" in payload:
+        setattr(kernel, "score_mod_bwd", _load_python_callable(payload.get("score_mod_bwd_ref")))
     return kernel
 
 
